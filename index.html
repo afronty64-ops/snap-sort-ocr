@@ -91,6 +91,12 @@
     </label>
     <div class="thumbs" id="thumbs"></div>
     <div class="opts">
+      <label>Mode
+        <select id="modeSel">
+          <option value="numbers">Numbers &amp; codes (SIM cards, serials)</option>
+          <option value="text">Text (notes, documents)</option>
+        </select>
+      </label>
       <label>Language
         <select id="langSel">
           <option value="eng">English</option>
@@ -230,11 +236,113 @@ function cleanText(data){
     const good = data.lines.filter(l=>{
       const t=(l.text||'').trim();
       const alnum=(t.match(/[\p{L}\p{N}]/gu)||[]).length;
-      return t.length>0 && alnum>=2 && alnum/t.length>0.5 && (l.confidence===undefined || l.confidence>=45);
+      const hasDigit=/\p{N}/u.test(t);
+      // be lenient with anything containing digits (prices, dates, phone numbers, single digits)
+      if(hasDigit) return t.length>0 && (l.confidence===undefined || l.confidence>=20);
+      return alnum>=2 && alnum/t.length>0.5 && (l.confidence===undefined || l.confidence>=40);
     }).map(l=>l.text.trim());
     return good.join('\n');
   }
   return (data.text||'').trim();
+}
+
+
+// ---------- Numbers & codes mode ----------
+function luhnOk(d){
+  let sum=0, alt=false;
+  for(let i=d.length-1;i>=0;i--){
+    let n=+d[i]; if(alt){ n*=2; if(n>9) n-=9; } sum+=n; alt=!alt;
+  }
+  return sum%10===0;
+}
+
+function grayCanvas(bmp, longSide){
+  const sc = longSide/Math.max(bmp.width,bmp.height);
+  const w=Math.round(bmp.width*sc), h=Math.round(bmp.height*sc);
+  const c=document.createElement('canvas'); c.width=w; c.height=h;
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+  ctx.imageSmoothingQuality='high';
+  ctx.drawImage(bmp,0,0,w,h);
+  const img=ctx.getImageData(0,0,w,h), d=img.data, n=w*h;
+  const g=new Uint8ClampedArray(n), hist=new Uint32Array(256);
+  for(let i=0;i<n;i++){ const v=0.299*d[i*4]+0.587*d[i*4+1]+0.114*d[i*4+2]; g[i]=v; hist[v|0]++; }
+  let acc=0, lo=0, hi=255;
+  for(let v=0;v<256;v++){ acc+=hist[v]; if(acc>n*0.01){lo=v;break;} }
+  acc=0;
+  for(let v=255;v>=0;v--){ acc+=hist[v]; if(acc>n*0.01){hi=v;break;} }
+  const span=Math.max(1,hi-lo);
+  for(let i=0;i<n;i++){
+    const v=Math.max(0,Math.min(255,(g[i]-lo)*255/span));
+    d[i*4]=d[i*4+1]=d[i*4+2]=v; d[i*4+3]=255;
+  }
+  ctx.putImageData(img,0,0);
+  return c;
+}
+
+async function scanNumbers(worker, file, onFrac){
+  const bmp = await createImageBitmap(file,{imageOrientation:'from-image'});
+  const scales=[2000,3200], TILE=1000, STEP=700;
+  const plan=[];
+  scales.forEach(L=>{
+    const sc=L/Math.max(bmp.width,bmp.height);
+    const W=Math.round(bmp.width*sc), H=Math.round(bmp.height*sc);
+    const xs=[], ys=[];
+    for(let x=0; ; x+=STEP){ xs.push(Math.min(x,Math.max(0,W-TILE))); if(x+TILE>=W) break; }
+    for(let y=0; ; y+=STEP){ ys.push(Math.min(y,Math.max(0,H-TILE))); if(y+TILE>=H) break; }
+    ys.forEach(y=>xs.forEach(x=>plan.push({L,x,y})));
+  });
+  const canv={}; scales.forEach(L=>canv[L]=grayCanvas(bmp,L));
+  const toks=[];
+  for(let k=0;k<plan.length;k++){
+    const {L,x,y}=plan[k], src=canv[L];
+    const tw=Math.min(TILE,src.width-x), th=Math.min(TILE,src.height-y);
+    const t=document.createElement('canvas'); t.width=tw; t.height=th;
+    t.getContext('2d').drawImage(src,x,y,tw,th,0,0,tw,th);
+    try{
+      const {data}=await worker.recognize(t);
+      (data.words||[]).forEach(w=>{
+        const digits=(w.text||'').replace(/\D/g,'');
+        if(digits.length>=3 && w.bbox){
+          toks.push({t:digits, cx:(x+(w.bbox.x0+w.bbox.x1)/2)/L, cy:(y+(w.bbox.y0+w.bbox.y1)/2)/L,
+                     w:(w.bbox.x1-w.bbox.x0)/L, h:Math.max(0.004,(w.bbox.y1-w.bbox.y0)/L)});
+        }
+      });
+    }catch(e){}
+    onFrac((k+1)/plan.length);
+  }
+  // de-duplicate tokens seen in overlapping tiles / scales
+  const uniq=[];
+  toks.forEach(a=>{
+    if(!uniq.some(b=>b.t===a.t && Math.abs(b.cx-a.cx)<0.015 && Math.abs(b.cy-a.cy)<0.015)) uniq.push(a);
+  });
+  const used=new Set(), found=[], partial=[];
+  const starts=uniq.filter(a=>a.t.startsWith('89') && a.t.length>=5);
+  starts.sort((a,b)=>a.cy-b.cy);
+  starts.forEach(a=>{
+    if(a.t.length>=18){ found.push(a.t.slice(0,20)); used.add(a); return; }
+    const chain=[a]; let cur=a;
+    for(let i=0;i<3;i++){
+      let best=null,bd=1e9;
+      uniq.forEach(b=>{
+        if(used.has(b)||chain.includes(b)) return;
+        const dy=b.cy-cur.cy, dx=Math.abs(b.cx-cur.cx);
+        if(dy>0.5*a.h && dy<3.5*a.h && dx<Math.max(a.w,b.w)*0.9 && b.t.length>=3 && b.t.length<=7){
+          const d=dy+dx; if(d<bd){bd=d;best=b;}
+        }
+      });
+      if(!best) break;
+      chain.push(best); cur=best;
+    }
+    const num=chain.map(c=>c.t).join('');
+    chain.forEach(c=>used.add(c));
+    if(chain.length===4 && num.length>=18 && num.length<=22) found.push(num);
+    else partial.push(num);
+  });
+  const lines=[];
+  [...new Set(found)].forEach(n=>lines.push(`${n}  ${luhnOk(n)?'✓':'(check digit fails – verify)'}`));
+  [...new Set(partial)].forEach(n=>lines.push(`${n}  (incomplete – retake closer)`));
+  uniq.filter(b=>!used.has(b) && b.t.length>=8).forEach(b=>lines.push(`${b.t}  (other number)`));
+  return lines.join('\n');
 }
 
 runBtn.addEventListener('click', async ()=>{
@@ -243,27 +351,37 @@ runBtn.addEventListener('click', async ()=>{
   progressEl.value = 0;
   const lang = document.getElementById('langSel').value;
   const enhance = document.getElementById('enhanceChk').checked;
+  const mode = document.getElementById('modeSel').value;
   const extracted = [];
   let worker = null;
   let curIdx = 0;
   try{
     statusEl.textContent = 'Loading OCR engine (first time takes a moment)…';
-    worker = await Tesseract.createWorker(lang, 1, {
+    worker = await Tesseract.createWorker(mode==='numbers' ? 'eng' : lang, 1, {
       logger: m=>{
-        if(m.status==='recognizing text'){
+        if(m.status==='recognizing text' && mode==='text'){
           progressEl.value = (curIdx + m.progress) / files.length;
         }
       }
     });
-    await worker.setParameters({ preserve_interword_spaces:'1', user_defined_dpi:'300' });
+    if(mode==='numbers'){
+      await worker.setParameters({ tessedit_char_whitelist:'0123456789', tessedit_pageseg_mode:'11', user_defined_dpi:'300' });
+    } else {
+      await worker.setParameters({ preserve_interword_spaces:'1', user_defined_dpi:'300' });
+    }
     for (let i=0; i<files.length; i++){
       curIdx = i;
       statusEl.textContent = `Reading photo ${i+1} of ${files.length}…`;
       const name = files[i].name || `photo-${i+1}`;
       try{
-        const input = enhance ? await preprocess(files[i]) : files[i];
-        const { data } = await worker.recognize(input);
-        extracted.push({ filename: name, text: cleanText(data) });
+        if(mode==='numbers'){
+          const txt = await scanNumbers(worker, files[i], f=>{ progressEl.value=(i+f)/files.length; });
+          extracted.push({ filename: name, text: txt });
+        } else {
+          const input = enhance ? await preprocess(files[i]) : files[i];
+          const { data } = await worker.recognize(input);
+          extracted.push({ filename: name, text: cleanText(data) });
+        }
       }catch(err){
         extracted.push({ filename: name, text: '' });
       }
@@ -278,7 +396,7 @@ runBtn.addEventListener('click', async ()=>{
   }
   progressEl.value = 1;
   statusEl.textContent = 'Grouping by topic…';
-  groups = await categorize(extracted);
+  groups = mode==='numbers' ? [{category:'Numbers found', items: extracted}] : await categorize(extracted);
   renderResults();
   statusEl.textContent = `Done — ${extracted.length} photo${extracted.length===1?'':'s'} processed. If the text looks wrong, try toggling "Enhance image" or the language.`;
   progressEl.style.display = 'none';

@@ -254,12 +254,14 @@ function cleanText(data){
 
 // ---------- Numbers & codes mode ----------
 function luhnOk(d){
+  if(!/^\d+$/.test(d)) return false;
   let sum=0, alt=false;
   for(let i=d.length-1;i>=0;i--){
     let n=+d[i]; if(alt){ n*=2; if(n>9) n-=9; } sum+=n; alt=!alt;
   }
   return sum%10===0;
 }
+function validSim(n){ return /^89\d{17,18}$/.test(n) && luhnOk(n); }
 
 function grayCanvas(bmp, longSide){
   const sc = longSide/Math.max(bmp.width,bmp.height);
@@ -361,17 +363,6 @@ function pickLevel(pyr,minLong){
   for(const lv of pyr){ if(Math.max(lv.c.width,lv.c.height)>=minLong) best=lv; }
   return best;
 }
-function luhnFix(n){
-  if(luhnOk(n)) return {n,fixed:false};
-  const CONF={'0':'869','1':'7','2':'7','3':'58','5':'368','6':'580','7':'12','8':'0369','9':'80'};
-  const cands=[];
-  for(let i=0;i<n.length;i++) for(const alt of (CONF[n[i]]||'')){
-    const m=n.slice(0,i)+alt+n.slice(i+1);
-    if(m.startsWith('89') && luhnOk(m)) cands.push({n:m,fixed:true,pos:i,from:n[i],to:alt});
-  }
-  return cands.length===1 ? cands[0] : null;
-}
-
 function validDate(d,m,y){ return y>=2000 && y<=2099 && m>=1 && m<=12 && d>=1 && d<=31; }
 
 // Recognise number formats:
@@ -415,11 +406,11 @@ function interpretText(text){
       const grp=lines.slice(i,i+4);
       if(grp.length===4 && grp.every(numeric)){
         const num=grp.map(mapDigits).join('');
-        if(num.length>=18 && num.length<=22) add('SIM',num);
+        if(num.length>=18 && num.length<=22){ add('SIM',num); i+=3; }
       }
-      i+=3; continue;
+      continue;
     }
-    if(l.startsWith('89') && l.length>=19 && l.length<=21){ add('SIM',l.slice(0,20)); continue; }
+    if(l.startsWith('89') && l.length>=18 && l.length<=22){ add('SIM',l); continue; }
     if(l.length===11 && validDate(+l.slice(6,8),+l.slice(4,6),+l.slice(0,4))){ add('A10',l); continue; }
     if(l.length>=23 && l.length<=25){ add('NETS',l); continue; }
   }
@@ -448,9 +439,10 @@ function finalizeCluster(cl){
   const notes=[], enough=cl.agree>=2 && cl.agree>=0.5*cl.members;
   let n=cl.n, ok=false;
   if(cl.type==='SIM'){
-    const f=luhnFix(n);
-    if(f){ n=f.n; ok=true; notes.push(f.fixed?`auto-corrected 1 digit (${f.from}→${f.to} at position ${f.pos+1}) using the check digit`:'check digit OK'); }
-    else notes.push('check digit fails – verify by eye');
+    ok=validSim(n);
+    if(!/^89\d+$/.test(n)) notes.push('expected digits starting with 89 – verify by eye');
+    else if(n.length!==19 && n.length!==20) notes.push(`expected 19 or 20 digits, got ${n.length} – verify by eye`);
+    else notes.push(ok?'check digit OK':'check digit fails – verify by eye');
   } else if(cl.type==='T3'){
     const dv=dateOk8(n.slice(3)); ok=dv&&enough;
     notes.push(!dv?'date looks wrong – verify':(!enough?'reads disagreed – verify':'date valid'));
@@ -574,7 +566,7 @@ async function scanNumbers(worker, file, onFrac){
       }
       if(pick){
         let reads=[pick.items];
-        const strong=pick.items.every(x=>x.type==='SIM' && luhnOk(x.n));
+        const strong=pick.items.every(x=>x.type==='SIM' && validSim(x.n));
         if(!strong){
           const more=[];                                          // bigger letter sizes read more reliably
           for(const [t,M] of [[50,pick.M],[64,pick.M],[46,pick.M],[56,28-pick.M]]){

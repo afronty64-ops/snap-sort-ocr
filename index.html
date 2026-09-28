@@ -71,6 +71,7 @@
     width:100%;border:none;background:transparent;color:var(--ink);font:inherit;font-size:.9rem;
     resize:vertical;min-height:44px;padding:0;
   }
+  .note{font-size:.75rem;color:var(--sub);margin-top:4px;}
   .empty{color:var(--sub);font-size:.9rem;text-align:center;padding:30px 0;}
   .toast{
     position:fixed;left:50%;bottom:24px;transform:translateX(-50%);
@@ -149,7 +150,8 @@ const copyBtn = document.getElementById('copyBtn');
 const toastEl = document.getElementById('toast');
 
 let files = [];
-let groups = null; // [{category, items:[{filename, text}]}]
+let groups = null;
+let modeUsed = 'text'; // [{category, items:[{filename, text}]}]
 
 function toast(msg){
   toastEl.textContent = msg;
@@ -325,14 +327,14 @@ function findDigitBlocks(g,w,h){
       if(ratio<0.65||ratio>1.55) continue;
       const gx=Math.max(0,Math.max(a.x0,b.x0)-Math.min(a.x1,b.x1));
       const gy=Math.max(0,Math.max(a.y0,b.y0)-Math.min(a.y1,b.y1));
-      if(gx<0.7*hh && gy<0.9*hh) par[find(i)]=find(j);
+      if(gx<0.9*hh && gy<0.9*hh) par[find(i)]=find(j);
     }
   }
   const groups={};
   comps.forEach((c,i)=>{(groups[find(i)]=groups[find(i)]||[]).push(c);});
   const blocks=[];
   Object.values(groups).forEach(gr=>{
-    if(gr.length<10) return;
+    if(gr.length<8) return;
     const hs=gr.map(c=>c.h).sort((a,b)=>a-b), med=hs[hs.length>>1];
     if(gr.filter(c=>Math.abs(c.h-med)<0.25*med).length < 0.7*gr.length) return;
     blocks.push({x0:Math.min(...gr.map(c=>c.x0)), x1:Math.max(...gr.map(c=>c.x1)),
@@ -343,25 +345,56 @@ function findDigitBlocks(g,w,h){
   return blocks.sort((a,b)=>b.cnt-a.cnt).slice(0,20);
 }
 
-function assembleBlock(text){
-  const ls=(text||'').split(/\n+/).map(l=>l.replace(/\D/g,'')).filter(l=>l.length>=3);
+function validDate(d,m,y){ return y>=2000 && y<=2099 && m>=1 && m<=12 && d>=1 && d<=31; }
+
+// Recognise number formats:
+//  SIM  = 89… (19-20 digits)      T3 = HSD + ddmmyyyy + 3-digit seq (HSD01072026014)
+//  A10  = yyyymmdd + 3-digit seq (20260331003)      NETS = 24 digits
+function interpretText(text){
+  const lines=(text||'').toUpperCase().split(/\n+/).map(l=>l.replace(/[^A-Z0-9]/g,'')).filter(l=>l.length>=3);
   const out=[];
-  for(let i=0;i<ls.length;i++){
-    if(ls[i].startsWith('89')){
-      if(ls[i].length>=18){ out.push({n:ls[i].slice(0,20),kind:'sim'}); continue; }
-      const num=ls.slice(i,i+4).join('');
-      if(ls.length-i>=4 && num.length>=18 && num.length<=22) out.push({n:num,kind:'sim'});
-      else if(num.length>=10) out.push({n:num,kind:'partial'});
-      i+=3;
+  const add=(type,n,ok,notes)=>out.push({type,n,ok,notes:notes||[]});
+  for(let i=0;i<lines.length;i++){
+    let l=lines[i];
+    // ---- T3 (has letters HSD)
+    const t=l.match(/H[S5][D0]([0-9SDO]+)/);
+    if(t){
+      const body=t[1].replace(/S/g,'5').replace(/[DO]/g,'0');
+      const n='HSD'+body;
+      if(body.length===11){
+        const ok=validDate(+body.slice(0,2),+body.slice(2,4),+body.slice(4,8));
+        add('T3',n,ok,ok?['date valid']:['date looks wrong – verify']);
+      } else add('T3',n,false,[`expected 11 digits after HSD, got ${body.length} – verify`]);
+      continue;
     }
-  }
-  if(!out.length && ls.length>=3){
-    const L=ls.map(l=>l.length);
-    if(Math.max(...L)-Math.min(...L)<=1 && L[0]>=4 && ls.join('').length>=10) out.push({n:ls.join(''),kind:'code'});
+    if(/^[0-9SDO]+$/.test(l)) l=l.replace(/S/g,'5').replace(/[DO]/g,'0'); else continue;
+    // ---- SIM stacked over 4 short lines (89450 / 42121 / 03252 / 22450)
+    if(l.startsWith('89') && l.length<18){
+      const num=lines.slice(i,i+4).join('');
+      const cnt=lines.slice(i,i+4).length;
+      if(cnt===4 && /^[0-9]+$/.test(num) && num.length>=18 && num.length<=22){
+        const ok=luhnOk(num); add('SIM',num,ok,[ok?'check digit OK':'check digit fails – verify']);
+      } else if(num.length>=10) add('Incomplete',num,false,['SIM number cut off – retake closer']);
+      i+=3; continue;
+    }
+    if(l.startsWith('89') && l.length>=19 && l.length<=21){
+      const num=l.slice(0,20), ok=luhnOk(num);
+      add('SIM',num,ok,[ok?'check digit OK':'check digit fails – verify']); continue;
+    }
+    if(l.length===11){
+      const a10=validDate(+l.slice(6,8),+l.slice(4,6),+l.slice(0,4));
+      const t3=validDate(+l.slice(0,2),+l.slice(2,4),+l.slice(4,8));
+      if(a10) add('A10',l,true,t3?['could also be a T3 date']:['date valid']);
+      else if(t3) add('T3','HSD'+l,true,['date valid','no HSD prefix read – added']);
+      else add('Unknown',l,false,['11 digits but date not valid – verify']);
+      continue;
+    }
+    if(l.length===24){ add('NETS',l,true,['24 digits']); continue; }
+    if(l.length>=23 && l.length<=25){ add('NETS',l,false,[`expected 24 digits, got ${l.length} – verify`]); continue; }
+    if(l.length>=8) add('Unknown',l,false,[`${l.length} digits, format not recognised`]);
   }
   return out;
 }
-
 
 function stretchGray(c){
   const ctx=c.getContext('2d',{willReadFrequently:true});
@@ -443,7 +476,7 @@ async function scanNumbers(worker, file, onFrac){
   const readBlock=async (bl,sc,rot,target,M)=>{
     let text='';
     try{ text=(await worker.recognize(renderBlock(img,sc,bl,rot,target,M))).data.text; }catch(e){}
-    return assembleBlock(text);
+    return interpretText(text);
   };
   for(let k=0;k<jobs.length;k++){
     const {bl,sc,L}=jobs[k];
@@ -457,27 +490,105 @@ async function scanNumbers(worker, file, onFrac){
           const found=await readBlock(bl,sc,rot,30,M);
           if(!found.length) continue;
           if(!best){ best=found; bestRot=rot; bestM=M; }
-          if(found.some(x=>x.kind==='sim' && luhnOk(x.n))){ best=found; valid=true; break; }
+          if(found.some(x=>x.ok)){ best=found; valid=true; break; }
         }
         if(valid) break;
       }
       if(best && !valid){
         for(const t of [24,38]){
           const found=await readBlock(bl,sc,bestRot,t,bestM);
-          if(found.some(x=>x.kind==='sim' && luhnOk(x.n))){ best=found; valid=true; break; }
+          if(found.some(x=>x.ok)){ best=found; valid=true; break; }
         }
       }
       if(valid) done.push([nx,ny]);
-      if(best) best.forEach(x=>{ if(!seenNums.has(x.n)){ seenNums.add(x.n); results.push(x); } });
+      if(best) best.forEach(x=>{ const key=x.type+x.n; if(!seenNums.has(key)){ seenNums.add(key); results.push(x); } });
     }
     onFrac((k+1)/jobs.length);
   }
-  const lines=[];
-  results.filter(x=>x.kind==='sim').forEach(x=>lines.push(`${x.n}  ${luhnOk(x.n)?'✓':'(check digit fails – verify by eye)'}`));
-  results.filter(x=>x.kind==='code').forEach(x=>lines.push(`${x.n}  (code)`));
-  results.filter(x=>x.kind==='partial').forEach(x=>lines.push(`${x.n}  (incomplete – retake closer)`));
-  return lines.join('\n');
+  return results;
 }
+
+// ---------- Smarter regular-text OCR ----------
+function medianOf(a){ if(!a.length) return 0; const b=[...a].sort((x,y)=>x-y); return b[b.length>>1]; }
+function textScore(data){
+  let n=0;
+  (data.words||[]).forEach(w=>{ if((w.confidence||0)>=60) n+=(w.text||'').replace(/[^\p{L}\p{N}]/gu,'').length; });
+  return n;
+}
+function medWordHeight(data){
+  return medianOf((data.words||[]).filter(w=>(w.confidence||0)>=50 && (w.text||'').length>=3 && w.bbox).map(w=>w.bbox.y1-w.bbox.y0));
+}
+function tiltDegrees(data){
+  const angs=[];
+  (data.lines||[]).forEach(l=>{
+    const ws=(l.words||[]).filter(w=>w.bbox);
+    if(ws.length<4) return;
+    const xs=ws.map(w=>(w.bbox.x0+w.bbox.x1)/2), ys=ws.map(w=>(w.bbox.y0+w.bbox.y1)/2);
+    const mx=xs.reduce((a,b)=>a+b)/xs.length, my=ys.reduce((a,b)=>a+b)/ys.length;
+    let sxx=0,sxy=0; xs.forEach((x,i)=>{ sxx+=(x-mx)*(x-mx); sxy+=(x-mx)*(ys[i]-my); });
+    if(sxx>0 && Math.sqrt(sxx)>150) angs.push(Math.atan(sxy/sxx)*180/Math.PI);
+  });
+  return angs.length>=2 ? medianOf(angs) : 0;
+}
+function imgToCanvas(img, longSide, rotDeg){
+  const sc=longSide/Math.max(img.width,img.height), w=img.width*sc, h=img.height*sc;
+  const r=rotDeg*Math.PI/180, cw=Math.round(Math.abs(w*Math.cos(r))+Math.abs(h*Math.sin(r))), ch=Math.round(Math.abs(w*Math.sin(r))+Math.abs(h*Math.cos(r)));
+  const c=document.createElement('canvas'); c.width=cw; c.height=ch;
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+  ctx.fillStyle='#fff'; ctx.fillRect(0,0,cw,ch);
+  ctx.imageSmoothingQuality='high';
+  ctx.translate(cw/2,ch/2); ctx.rotate(r); ctx.drawImage(img,-w/2,-h/2,w,h);
+  stretchGray(c);
+  return c;
+}
+function binarizeCanvas(src){
+  const w=src.width, h=src.height, c=document.createElement('canvas'); c.width=w; c.height=h;
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+  ctx.drawImage(src,0,0);
+  const img=ctx.getImageData(0,0,w,h), d=img.data, W=w+1, integ=new Float64Array(W*(h+1));
+  for(let y=1;y<=h;y++){ let row=0; for(let x=1;x<=w;x++){ row+=d[((y-1)*w+(x-1))*4]; integ[y*W+x]=integ[(y-1)*W+x]+row; } }
+  const r=Math.max(15,Math.round(Math.min(w,h)/24));
+  for(let y=0;y<h;y++){
+    const y0=Math.max(0,y-r), y1=Math.min(h,y+r+1);
+    for(let x=0;x<w;x++){
+      const x0=Math.max(0,x-r), x1=Math.min(w,x+r+1);
+      const mean=(integ[y1*W+x1]-integ[y0*W+x1]-integ[y1*W+x0]+integ[y0*W+x0])/((x1-x0)*(y1-y0));
+      const k=(y*w+x)*4, v=d[k]<mean*0.9?0:255; d[k]=d[k+1]=d[k+2]=v;
+    }
+  }
+  ctx.putImageData(img,0,0);
+  return c;
+}
+async function ocrTextSmart(worker, file, allowBinarize){
+  const img=await loadImg(file), base=Math.max(img.width,img.height);
+  const rec=async (L,rot,bin)=>{
+    let c=imgToCanvas(img,L,rot); if(bin) c=binarizeCanvas(c);
+    const data=(await worker.recognize(c)).data;
+    return {data,score:textScore(data),L,rot,bin};
+  };
+  let L=Math.min(2000,base);
+  let best=await rec(L,0,false);
+  if(best.score<40 || (best.data.confidence||0)<50){          // maybe sideways / upside down
+    for(const deg of [90,180,270]){ const r=await rec(L,deg,false); if(r.score>best.score*1.2+10) best=r; }
+  }
+  const tilt=tiltDegrees(best.data);                            // straighten slightly tilted pages
+  if(Math.abs(tilt)>1.2 && Math.abs(tilt)<30){
+    const r=await rec(best.L,best.rot-tilt,false); if(r.score>=best.score*0.95) best=r;
+  }
+  const mh=medWordHeight(best.data);                            // rescale so letters are a good size
+  if(mh>0){
+    const ratio=TARGET_H/mh;
+    if(ratio<0.75 || ratio>1.35){
+      const L2=Math.max(1000,Math.min(3600,base*2.5,best.L*ratio));
+      const r=await rec(L2,best.rot,false); if(r.score>best.score) best=r;
+    }
+  }
+  if(allowBinarize && (best.data.confidence||0)<75){            // uneven lighting: try black & white
+    const r=await rec(best.L,best.rot,true); if(r.score>best.score*1.05) best=r;
+  }
+  return cleanText(best.data);
+}
+const TARGET_H=38;
 
 async function plainCanvas(file){
   const im=await loadImg(file), sc=Math.min(1, 2400/Math.max(im.width,im.height));
@@ -511,7 +622,7 @@ runBtn.addEventListener('click', async ()=>{
       }
     });
     if(mode==='numbers'){
-      await worker.setParameters({ tessedit_char_whitelist:'0123456789', tessedit_pageseg_mode:'6', user_defined_dpi:'300' });
+      await worker.setParameters({ tessedit_char_whitelist:'HSD0123456789', tessedit_pageseg_mode:'6', user_defined_dpi:'300' });
     } else {
       await worker.setParameters({ preserve_interword_spaces:'1', user_defined_dpi:'300' });
     }
@@ -521,18 +632,11 @@ runBtn.addEventListener('click', async ()=>{
       const name = files[i].name || `photo-${i+1}`;
       try{
         if(mode==='numbers'){
-          const txt = await scanNumbers(worker, files[i], f=>{ progressEl.value=(i+f)/files.length; });
-          extracted.push({ filename: name, text: txt });
+          const res = await scanNumbers(worker, files[i], f=>{ progressEl.value=(i+f)/files.length; });
+          extracted.push({ filename: name, results: res, text: '' });
         } else {
-          const input = enhance ? await preprocess(files[i]) : await plainCanvas(files[i]);
-          let { data } = await worker.recognize(input);
-          if((data.confidence||0) < 60){
-            for(const deg of [90,180,270]){
-              const r = await worker.recognize(rotCanvas(input,deg));
-              if((r.data.confidence||0) > (data.confidence||0) + 5) data = r.data;
-            }
-          }
-          extracted.push({ filename: name, text: cleanText(data) });
+          const txt = await ocrTextSmart(worker, files[i], enhance);
+          extracted.push({ filename: name, text: txt });
         }
       }catch(err){
         lastErr = err;
@@ -549,7 +653,8 @@ runBtn.addEventListener('click', async ()=>{
   }
   progressEl.value = 1;
   statusEl.textContent = 'Grouping by topic…';
-  groups = mode==='numbers' ? [{category:'Numbers found', items: extracted}] : await categorize(extracted);
+  modeUsed = mode;
+  groups = mode==='numbers' ? numberGroups(extracted) : await categorize(extracted);
   renderResults();
   statusEl.textContent = lastErr ? `Some photos failed: ${lastErr.message||lastErr}. ` : ''; statusEl.textContent += `Done — ${extracted.length} photo${extracted.length===1?'':'s'} processed. If the text looks wrong, try toggling "Enhance image" or the language.`;
   progressEl.style.display = 'none';
@@ -619,6 +724,39 @@ function localGroup(items){
   return out;
 }
 
+const NUM_TITLES={SIM:'SIM cards',T3:'T3 registers',A10:'A10 registers',NETS:'NETS terminals',Unknown:'Unrecognised numbers',Incomplete:'Incomplete reads'};
+function sortKey(type,n){
+  if(type==='T3' && n.length===14) return n.slice(7,11)+n.slice(5,7)+n.slice(3,5)+n.slice(11); // by date, then sequence
+  return n;
+}
+function numberGroups(extracted){
+  const seen=new Map();   // same number in several photos is listed once
+  extracted.forEach(ex=>(ex.results||[]).forEach(r=>{
+    const k=r.type+r.n;
+    if(seen.has(k)) seen.get(k).dup++; else { r.dup=0; seen.set(k,r); }
+  }));
+  const all=[...seen.values()];
+  const out=[];
+  Object.keys(NUM_TITLES).forEach(type=>{
+    const rs=all.filter(r=>r.type===type);
+    if(!rs.length) return;
+    rs.sort((a,b)=>sortKey(type,a.n)<sortKey(type,b.n)?-1:1);
+    const label=(type==='Unknown'||type==='Incomplete')?type:type;
+    out.push({
+      category: NUM_TITLES[type], count: rs.length,
+      items:[{ filename:`${rs.length} number${rs.length===1?'':'s'}, sorted`,
+               text: rs.map(r=>`${label}: ${r.n}`).join('\n'),
+               notes: rs.filter(r=>r.notes.length && !(r.ok)).map(r=>`${r.n} — ${r.notes.join(', ')}`)
+                        .concat(rs.filter(r=>r.dup).map(r=>`${r.n} — seen in ${r.dup+1} photos, listed once`))
+                        .concat(rs.some(r=>r.ok)?[`${rs.filter(r=>r.ok).length} verified by format check`]:[]) }]
+    });
+  });
+  const empties=extracted.filter(ex=>!(ex.results||[]).length);
+  if(empties.length) out.push({category:'No numbers found', count:empties.length,
+    items:[{filename:empties.map(e=>e.filename).join(', '), text:'', notes:['Try a closer, sharper, well-lit photo.']}]});
+  return out;
+}
+
 function renderResults(){
   resultsEl.innerHTML = '';
   if(!groups || !groups.length){
@@ -628,12 +766,14 @@ function renderResults(){
   groups.forEach(g=>{
     const sec = document.createElement('div');
     sec.className = 'cat';
-    sec.innerHTML = `<h2>${escapeHtml(g.category)} <span class="n">${g.items.length}</span></h2>`;
+    sec.innerHTML = `<h2>${escapeHtml(g.category)} <span class="n">${g.count ?? g.items.length}</span></h2>`;
     g.items.forEach(it=>{
       const e = document.createElement('div');
       e.className = 'entry';
+      const rows = Math.min(12, Math.max(2, (it.text||'').split('\n').length));
       e.innerHTML = `<div class="fname">${escapeHtml(it.filename)}</div>
-        <textarea rows="3">${escapeHtml(it.text || '(nothing found in this photo – try a closer, sharper, well-lit shot)')}</textarea>`;
+        <textarea rows="${rows}" placeholder="(nothing found in this photo)">${escapeHtml(it.text || '')}</textarea>
+        ${(it.notes||[]).map(n=>`<div class="note">${escapeHtml(n)}</div>`).join('')}`;
       sec.appendChild(e);
     });
     resultsEl.appendChild(sec);
@@ -646,17 +786,19 @@ function escapeHtml(s){
 
 function assembleText(){
   if(!groups) return '';
-  // pull current textarea values in DOM order in case user edited
+  // clean text only (no notes / check marks); reads current textarea values so edits are kept
+  const num = modeUsed==='numbers';
   let out = '';
-  const cats = resultsEl.querySelectorAll('.cat');
-  cats.forEach(catEl=>{
+  resultsEl.querySelectorAll('.cat').forEach(catEl=>{
     const title = catEl.querySelector('h2').firstChild.textContent.trim();
-    out += `## ${title}\n\n`;
+    const blocks = [];
     catEl.querySelectorAll('.entry').forEach(entry=>{
-      const fname = entry.querySelector('.fname').textContent;
-      const text = entry.querySelector('textarea').value;
-      out += `[${fname}]\n${text}\n\n`;
+      const text = entry.querySelector('textarea').value.trim();
+      if(!text) return;
+      blocks.push(num ? text : `[${entry.querySelector('.fname').textContent}]\n${text}`);
     });
+    if(!blocks.length) return;
+    out += `## ${title}\n\n${blocks.join(num ? '\n' : '\n\n')}\n\n`;
   });
   return out.trim() + '\n';
 }

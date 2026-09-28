@@ -86,7 +86,7 @@
 
   <div class="card">
     <label class="drop" id="dropZone">
-      <input type="file" id="fileInput" accept="image/*" multiple capture="environment">
+      <input type="file" id="fileInput" accept="image/*" multiple>
       Tap to add photos<br><span style="font-size:.8rem">(camera or gallery, add as many as you like)</span>
     </label>
     <div class="thumbs" id="thumbs"></div>
@@ -188,7 +188,7 @@ clearBtn.addEventListener('click', ()=>{
 });
 
 async function preprocess(file){
-  const bmp = await createImageBitmap(file, {imageOrientation:'from-image'});
+  const bmp = await loadImg(file);
   // Tesseract works best when text is ~25-35px tall; normalise size
   let scale = 2400 / Math.max(bmp.width, bmp.height);
   scale = Math.min(Math.max(scale, 0.4), 3);
@@ -309,8 +309,8 @@ function findDigitBlocks(g,w,h){
       if(py>0&&ink[p-w]&&!seen[p-w]){seen[p-w]=1;stack.push(p-w);}
       if(py<h-1&&ink[p+w]&&!seen[p+w]){seen[p+w]=1;stack.push(p+w);}
     }
-    const ch=maxy-miny+1, cw=maxx-minx+1;
-    if(ch>=16&&ch<=70&&cw>=4&&cw<=ch&&cnt>=30) comps.push({x0:minx,x1:maxx,y0:miny,y1:maxy,h:ch});
+    const ch=maxy-miny+1, cw=maxx-minx+1, lg=Math.max(ch,cw), sh=Math.min(ch,cw);
+    if(lg>=16&&lg<=70&&sh>=4&&cnt>=30) comps.push({x0:minx,x1:maxx,y0:miny,y1:maxy,h:lg});
   }
   // cluster neighbouring digit-sized pieces into text blocks
   const par=comps.map((_,i)=>i);
@@ -322,7 +322,7 @@ function findDigitBlocks(g,w,h){
       if(ratio<0.65||ratio>1.55) continue;
       const gx=Math.max(0,Math.max(a.x0,b.x0)-Math.min(a.x1,b.x1));
       const gy=Math.max(0,Math.max(a.y0,b.y0)-Math.min(a.y1,b.y1));
-      if(gx<0.55*hh && gy<0.8*hh) par[find(i)]=find(j);
+      if(gx<0.7*hh && gy<0.9*hh) par[find(i)]=find(j);
     }
   }
   const groups={};
@@ -333,7 +333,9 @@ function findDigitBlocks(g,w,h){
     const hs=gr.map(c=>c.h).sort((a,b)=>a-b), med=hs[hs.length>>1];
     if(gr.filter(c=>Math.abs(c.h-med)<0.25*med).length < 0.7*gr.length) return;
     blocks.push({x0:Math.min(...gr.map(c=>c.x0)), x1:Math.max(...gr.map(c=>c.x1)),
-                 y0:Math.min(...gr.map(c=>c.y0)), y1:Math.max(...gr.map(c=>c.y1)), hmed:med, cnt:gr.length});
+                 y0:Math.min(...gr.map(c=>c.y0)), y1:Math.max(...gr.map(c=>c.y1)), hmed:med, cnt:gr.length,
+                 pts:gr.map(c=>[(c.x0+c.x1)/2,(c.y0+c.y1)/2]),
+                 cx:gr.reduce((a,c)=>a+(c.x0+c.x1)/2,0)/gr.length, cy:gr.reduce((a,c)=>a+(c.y0+c.y1)/2,0)/gr.length});
   });
   return blocks.sort((a,b)=>b.cnt-a.cnt).slice(0,20);
 }
@@ -364,62 +366,127 @@ function stretchGray(c){
   const g=new Uint8ClampedArray(n), hist=new Uint32Array(256);
   for(let i=0;i<n;i++){ const v=0.299*d[i*4]+0.587*d[i*4+1]+0.114*d[i*4+2]; g[i]=v; hist[v|0]++; }
   let acc=0, lo=0, hi=255;
-  for(let v=0;v<256;v++){ acc+=hist[v]; if(acc>n*0.01){lo=v;break;} }
+  for(let v=0;v<256;v++){ acc+=hist[v]; if(acc>n*0.001){lo=v;break;} }
   acc=0;
-  for(let v=255;v>=0;v--){ acc+=hist[v]; if(acc>n*0.01){hi=v;break;} }
+  for(let v=255;v>=0;v--){ acc+=hist[v]; if(acc>n*0.10){hi=v;break;} }
   const span=Math.max(1,hi-lo);
   for(let i=0;i<n;i++){ const v=Math.max(0,Math.min(255,(g[i]-lo)*255/span)); d[i*4]=d[i*4+1]=d[i*4+2]=v; d[i*4+3]=255; }
   ctx.putImageData(img,0,0);
 }
 
 
+function loadImg(file){
+  // <img> decoding applies EXIF rotation and works on iOS Safari (createImageBitmap options don't)
+  return new Promise((res,rej)=>{
+    const url=URL.createObjectURL(file), img=new Image();
+    img.onload=()=>{ URL.revokeObjectURL(url); res(img); };
+    img.onerror=()=>{ URL.revokeObjectURL(url); rej(new Error('Could not open this image')); };
+    img.src=url;
+  });
+}
+
+function estimateAngle(pts,hmed){
+  // direction of nearest-neighbour vectors (digits sit closest to their left/right neighbour)
+  let sx=0, sy=0;
+  for(let i=0;i<pts.length;i++){
+    let bd=1e18, bj=-1;
+    for(let j=0;j<pts.length;j++){
+      if(i===j) continue;
+      const dx=pts[j][0]-pts[i][0], dy=pts[j][1]-pts[i][1], d=dx*dx+dy*dy;
+      if(d<bd){bd=d;bj=j;}
+    }
+    if(bj<0 || Math.sqrt(bd)>1.6*hmed) continue;
+    const ang=Math.atan2(pts[bj][1]-pts[i][1], pts[bj][0]-pts[i][0]);
+    sx+=Math.cos(2*ang); sy+=Math.sin(2*ang);
+  }
+  return 0.5*Math.atan2(sy,sx);
+}
+
+function renderBlock(img, sc, bl, rot, target, M){
+  M = M||0;
+  const f=target/bl.hmed, co=Math.cos(-rot), si=Math.sin(-rot);
+  let hx=0, hy=0;
+  bl.pts.forEach(p=>{
+    const dx=p[0]-bl.cx, dy=p[1]-bl.cy;
+    hx=Math.max(hx,Math.abs(dx*co-dy*si)); hy=Math.max(hy,Math.abs(dx*si+dy*co));
+  });
+  hx+=bl.hmed*0.55; hy+=bl.hmed*0.7;
+  const tw=Math.max(8,Math.round(2*hx*f)), th=Math.max(8,Math.round(2*hy*f));
+  const ow=tw+2*M, oh=th+2*M;
+  const c=document.createElement('canvas'); c.width=ow; c.height=oh;
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+  ctx.fillStyle='#fff'; ctx.fillRect(0,0,ow,oh);
+  ctx.imageSmoothingQuality='high';
+  if(M){ ctx.beginPath(); ctx.rect(M,M,tw,th); ctx.clip(); }   // keep only the digit block; white margin around it
+  ctx.scale(f,f); ctx.translate(ow/(2*f),oh/(2*f)); ctx.rotate(-rot);
+  ctx.scale(sc,sc); ctx.translate(-bl.cx/sc,-bl.cy/sc);
+  ctx.drawImage(img,0,0);
+  stretchGray(c);
+  return c;
+}
+
 async function scanNumbers(worker, file, onFrac){
-  const bmp = await createImageBitmap(file,{imageOrientation:'from-image'});
-  const results=[], seenNums=new Set();
-  const scales=[1600,2400];
-  const jobs=[];
-  for(const L of scales){
-    const sc=L/Math.max(bmp.width,bmp.height);
-    const gc=grayCanvas(bmp,L), w=gc.width, h=gc.height;
+  const img = await loadImg(file);
+  const results=[], seenNums=new Set(), done=[], jobs=[];
+  for(const L of [1600,2400]){
+    const sc=L/Math.max(img.width,img.height);
+    const gc=grayCanvas(img,L), w=gc.width, h=gc.height;
     const d=gc.getContext('2d',{willReadFrequently:true}).getImageData(0,0,w,h).data;
     const g=new Uint8ClampedArray(w*h);
     for(let i=0;i<w*h;i++) g[i]=d[i*4];
-    findDigitBlocks(g,w,h).forEach(bl=>jobs.push({bl,sc,w,h}));
+    findDigitBlocks(g,w,h).forEach(bl=>jobs.push({bl,sc,L}));
     await new Promise(r=>setTimeout(r,0));
   }
+  const readBlock=async (bl,sc,rot,target,M)=>{
+    let text='';
+    try{ text=(await worker.recognize(renderBlock(img,sc,bl,rot,target,M))).data.text; }catch(e){}
+    return assembleBlock(text);
+  };
   for(let k=0;k<jobs.length;k++){
-    const {bl,sc,w,h}=jobs[k];
-    let best=null;
-    for(const target of [30,24,38]){
-      const pad=Math.round(0.4*bl.hmed);
-      const x0=Math.max(0,bl.x0-pad), y0=Math.max(0,bl.y0-pad);
-      const x1=Math.min(w,bl.x1+pad), y1=Math.min(h,bl.y1+pad);
-      const f=target/bl.hmed;
-      const c=document.createElement('canvas');
-      c.width=Math.max(8,Math.round((x1-x0)*f)); c.height=Math.max(8,Math.round((y1-y0)*f));
-      c.getContext('2d').drawImage(bmp,x0/sc,y0/sc,(x1-x0)/sc,(y1-y0)/sc,0,0,c.width,c.height);
-      stretchGray(c);
-      let text='';
-      try{ text=(await worker.recognize(c)).data.text; }catch(e){}
-      const found=assembleBlock(text);
-      if(!found.length) continue;
-      const ok=found.some(x=>x.kind==='sim' && luhnOk(x.n));
-      if(!best || ok){ best=found; }
-      if(ok) break;
+    const {bl,sc,L}=jobs[k];
+    const nx=bl.cx/L, ny=bl.cy/L;
+    if(!done.some(q=>Math.hypot(q[0]-nx,q[1]-ny)<0.03)){
+      const th=estimateAngle(bl.pts,bl.hmed);
+      const rots=[th, th+Math.PI, th+Math.PI/2, th-Math.PI/2];
+      let best=null, bestRot=0, bestM=0, valid=false;
+      for(const M of [0,28]){
+        for(const rot of rots){
+          const found=await readBlock(bl,sc,rot,30,M);
+          if(!found.length) continue;
+          if(!best){ best=found; bestRot=rot; bestM=M; }
+          if(found.some(x=>x.kind==='sim' && luhnOk(x.n))){ best=found; valid=true; break; }
+        }
+        if(valid) break;
+      }
+      if(best && !valid){
+        for(const t of [24,38]){
+          const found=await readBlock(bl,sc,bestRot,t,bestM);
+          if(found.some(x=>x.kind==='sim' && luhnOk(x.n))){ best=found; valid=true; break; }
+        }
+      }
+      if(valid) done.push([nx,ny]);
+      if(best) best.forEach(x=>{ if(!seenNums.has(x.n)){ seenNums.add(x.n); results.push(x); } });
     }
-    if(best) best.forEach(x=>{
-      if(seenNums.has(x.n)) return;
-      seenNums.add(x.n); results.push(x);
-    });
     onFrac((k+1)/jobs.length);
   }
   const lines=[];
   results.filter(x=>x.kind==='sim').forEach(x=>lines.push(`${x.n}  ${luhnOk(x.n)?'✓':'(check digit fails – verify by eye)'}`));
   results.filter(x=>x.kind==='code').forEach(x=>lines.push(`${x.n}  (code)`));
   results.filter(x=>x.kind==='partial').forEach(x=>lines.push(`${x.n}  (incomplete – retake closer)`));
-  return lines.length ? lines.join('\n') : '';
+  return lines.join('\n');
 }
 
+async function plainCanvas(file){
+  const im=await loadImg(file), sc=Math.min(1, 2400/Math.max(im.width,im.height));
+  const c=document.createElement('canvas'); c.width=Math.round(im.width*sc); c.height=Math.round(im.height*sc);
+  c.getContext('2d').drawImage(im,0,0,c.width,c.height); return c;
+}
+function rotCanvas(c,deg){
+  const o=document.createElement('canvas'), q=deg%180!==0;
+  o.width=q?c.height:c.width; o.height=q?c.width:c.height;
+  const x=o.getContext('2d'); x.translate(o.width/2,o.height/2); x.rotate(deg*Math.PI/180); x.drawImage(c,-c.width/2,-c.height/2);
+  return o;
+}
 runBtn.addEventListener('click', async ()=>{
   runBtn.disabled = true;
   progressEl.style.display = 'block';
@@ -430,6 +497,7 @@ runBtn.addEventListener('click', async ()=>{
   const extracted = [];
   let worker = null;
   let curIdx = 0;
+  let lastErr = null;
   try{
     statusEl.textContent = 'Loading OCR engine (first time takes a moment)…';
     worker = await Tesseract.createWorker(mode==='numbers' ? 'eng' : lang, 1, {
@@ -453,11 +521,18 @@ runBtn.addEventListener('click', async ()=>{
           const txt = await scanNumbers(worker, files[i], f=>{ progressEl.value=(i+f)/files.length; });
           extracted.push({ filename: name, text: txt });
         } else {
-          const input = enhance ? await preprocess(files[i]) : files[i];
-          const { data } = await worker.recognize(input);
+          const input = enhance ? await preprocess(files[i]) : await plainCanvas(files[i]);
+          let { data } = await worker.recognize(input);
+          if((data.confidence||0) < 60){
+            for(const deg of [90,180,270]){
+              const r = await worker.recognize(rotCanvas(input,deg));
+              if((r.data.confidence||0) > (data.confidence||0) + 5) data = r.data;
+            }
+          }
           extracted.push({ filename: name, text: cleanText(data) });
         }
       }catch(err){
+        lastErr = err;
         extracted.push({ filename: name, text: '' });
       }
     }
@@ -473,7 +548,7 @@ runBtn.addEventListener('click', async ()=>{
   statusEl.textContent = 'Grouping by topic…';
   groups = mode==='numbers' ? [{category:'Numbers found', items: extracted}] : await categorize(extracted);
   renderResults();
-  statusEl.textContent = `Done — ${extracted.length} photo${extracted.length===1?'':'s'} processed. If the text looks wrong, try toggling "Enhance image" or the language.`;
+  statusEl.textContent = lastErr ? `Some photos failed: ${lastErr.message||lastErr}. ` : ''; statusEl.textContent += `Done — ${extracted.length} photo${extracted.length===1?'':'s'} processed. If the text looks wrong, try toggling "Enhance image" or the language.`;
   progressEl.style.display = 'none';
   runBtn.disabled = false;
   exportCard.style.display = 'block';

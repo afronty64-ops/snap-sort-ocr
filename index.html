@@ -315,7 +315,7 @@ function findDigitBlocks(g,w,h){
       if(py<h-1&&ink[p+w]&&!seen[p+w]){seen[p+w]=1;stack.push(p+w);}
     }
     const ch=maxy-miny+1, cw=maxx-minx+1, lg=Math.max(ch,cw), sh=Math.min(ch,cw);
-    if(lg>=16&&lg<=70&&sh>=4&&cnt>=30) comps.push({x0:minx,x1:maxx,y0:miny,y1:maxy,h:lg});
+    if(lg>=16&&lg<=70&&sh>=4&&sh>=0.28*lg&&cnt>=30) comps.push({x0:minx,x1:maxx,y0:miny,y1:maxy,h:lg});
   }
   // cluster neighbouring digit-sized pieces into text blocks
   const par=comps.map((_,i)=>i);
@@ -342,58 +342,125 @@ function findDigitBlocks(g,w,h){
                  pts:gr.map(c=>[(c.x0+c.x1)/2,(c.y0+c.y1)/2]),
                  cx:gr.reduce((a,c)=>a+(c.x0+c.x1)/2,0)/gr.length, cy:gr.reduce((a,c)=>a+(c.y0+c.y1)/2,0)/gr.length});
   });
-  return blocks.sort((a,b)=>b.cnt-a.cnt).slice(0,20);
+  return blocks.sort((a,b)=>b.cnt-a.cnt).slice(0,14);
+}
+
+function buildPyramid(img){
+  // repeated 2x halving = smooth downscale (one big drawImage step aliases badly on iOS Safari)
+  const levels=[{c:img,s:1}]; let cur=img, sc=1;
+  while(Math.max(cur.width,cur.height)>=900){
+    const nw=Math.round(cur.width/2), nh=Math.round(cur.height/2);
+    const c=document.createElement('canvas'); c.width=nw; c.height=nh;
+    const x=c.getContext('2d'); x.imageSmoothingQuality='high'; x.drawImage(cur,0,0,nw,nh);
+    sc/=2; levels.push({c,s:sc}); cur=c;
+  }
+  return levels;
+}
+function pickLevel(pyr,minLong){
+  let best=pyr[0];
+  for(const lv of pyr){ if(Math.max(lv.c.width,lv.c.height)>=minLong) best=lv; }
+  return best;
+}
+function luhnFix(n){
+  if(luhnOk(n)) return {n,fixed:false};
+  const CONF={'0':'869','1':'7','2':'7','3':'58','5':'368','6':'580','7':'12','8':'0369','9':'80'};
+  const cands=[];
+  for(let i=0;i<n.length;i++) for(const alt of (CONF[n[i]]||'')){
+    const m=n.slice(0,i)+alt+n.slice(i+1);
+    if(m.startsWith('89') && luhnOk(m)) cands.push({n:m,fixed:true,pos:i,from:n[i],to:alt});
+  }
+  return cands.length===1 ? cands[0] : null;
 }
 
 function validDate(d,m,y){ return y>=2000 && y<=2099 && m>=1 && m<=12 && d>=1 && d<=31; }
 
 // Recognise number formats:
-//  SIM  = 89… (19-20 digits)      T3 = HSD + ddmmyyyy + 3-digit seq (HSD01072026014)
-//  A10  = yyyymmdd + 3-digit seq (20260331003)      NETS = 24 digits
+//  SIM  = 89… (19-20 digits)          T3 = 3 letters (HSD / BOE …) + date + 3-digit seq (HSD01072026014)
+//  A10  = yyyymmdd + 3-digit seq (20260331003)          NETS = 24 digits
+function mapDigits(x){ return x.replace(/[OD]/g,'0').replace(/[IL]/g,'1').replace(/S/g,'5').replace(/B/g,'8').replace(/Z/g,'2'); }
+function dateOk8(b){
+  return validDate(+b.slice(0,2),+b.slice(2,4),+b.slice(4,8)) || validDate(+b.slice(2,4),+b.slice(0,2),+b.slice(4,8));
+}
+const KNOWN_T3=['HSD','BOE'];
+function lev(a,b){
+  const d=Array.from({length:a.length+1},(_,i)=>[i]);
+  for(let j=1;j<=b.length;j++) d[0][j]=j;
+  for(let i=1;i<=a.length;i++) for(let j=1;j<=b.length;j++)
+    d[i][j]=Math.min(d[i-1][j]+1,d[i][j-1]+1,d[i-1][j-1]+(a[i-1]===b[j-1]?0:1));
+  return d[a.length][b.length];
+}
 function interpretText(text){
   const lines=(text||'').toUpperCase().split(/\n+/).map(l=>l.replace(/[^A-Z0-9]/g,'')).filter(l=>l.length>=3);
-  const out=[];
-  const add=(type,n,ok,notes)=>out.push({type,n,ok,notes:notes||[]});
+  const out=[], add=(type,n)=>out.push({type,n});
+  const numeric=x=>/^[0-9OSDILBZ]{3,}$/.test(x);
   for(let i=0;i<lines.length;i++){
     let l=lines[i];
-    // ---- T3 (has letters HSD)
-    const t=l.match(/H[S5][D0]([0-9SDO]+)/);
-    if(t){
-      const body=t[1].replace(/S/g,'5').replace(/[DO]/g,'0');
-      const n='HSD'+body;
-      if(body.length===11){
-        const ok=validDate(+body.slice(0,2),+body.slice(2,4),+body.slice(4,8));
-        add('T3',n,ok,ok?['date valid']:['date looks wrong – verify']);
-      } else add('T3',n,false,[`expected 11 digits after HSD, got ${body.length} – verify`]);
+    const m=l.match(/([A-Z0-9]{3})([0-9]{11})$/);
+    if(m && (m[1].match(/[A-Z]/g)||[]).length>=2){
+      add('T3', m[1].replace(/0/g,'O').replace(/5/g,'S').replace(/8/g,'B').replace(/1/g,'I')+m[2]);
       continue;
     }
-    if(/^[0-9SDO]+$/.test(l)) l=l.replace(/S/g,'5').replace(/[DO]/g,'0'); else continue;
-    // ---- SIM stacked over 4 short lines (89450 / 42121 / 03252 / 22450)
-    if(l.startsWith('89') && l.length<18){
-      const num=lines.slice(i,i+4).join('');
-      const cnt=lines.slice(i,i+4).length;
-      if(cnt===4 && /^[0-9]+$/.test(num) && num.length>=18 && num.length<=22){
-        const ok=luhnOk(num); add('SIM',num,ok,[ok?'check digit OK':'check digit fails – verify']);
-      } else if(num.length>=10) add('Incomplete',num,false,['SIM number cut off – retake closer']);
+    if(l.length>=13 && l.length<=15){
+      const body=mapDigits(l.slice(-11).replace(/Q/g,'0').replace(/G/g,'6')), pre=l.slice(0,l.length-11);
+      if(/^[0-9]{11}$/.test(body) && dateOk8(body.slice(0,8)) && /^[A-Z0-9]{2,4}$/.test(pre) && (pre.match(/[A-Z]/g)||[]).length>=1){
+        let best=null, bd=9;
+        for(const k of KNOWN_T3){ const d=lev(pre,k); if(d<bd){bd=d;best=k;} }
+        if(best && bd<=2){ add('T3',best+body); continue; }
+      }
+    }
+    l=l.replace(/^[A-Z]{1,4}(?=[0-9OSDILBZ]{8})/,'');
+    if(!numeric(l)) continue;
+    l=mapDigits(l);
+    if(l.startsWith('89') && l.length<18){                       // SIM stacked over 4 short lines
+      const grp=lines.slice(i,i+4);
+      if(grp.length===4 && grp.every(numeric)){
+        const num=grp.map(mapDigits).join('');
+        if(num.length>=18 && num.length<=22) add('SIM',num);
+      }
       i+=3; continue;
     }
-    if(l.startsWith('89') && l.length>=19 && l.length<=21){
-      const num=l.slice(0,20), ok=luhnOk(num);
-      add('SIM',num,ok,[ok?'check digit OK':'check digit fails – verify']); continue;
-    }
-    if(l.length===11){
-      const a10=validDate(+l.slice(6,8),+l.slice(4,6),+l.slice(0,4));
-      const t3=validDate(+l.slice(0,2),+l.slice(2,4),+l.slice(4,8));
-      if(a10) add('A10',l,true,t3?['could also be a T3 date']:['date valid']);
-      else if(t3) add('T3','HSD'+l,true,['date valid','no HSD prefix read – added']);
-      else add('Unknown',l,false,['11 digits but date not valid – verify']);
-      continue;
-    }
-    if(l.length===24){ add('NETS',l,true,['24 digits']); continue; }
-    if(l.length>=23 && l.length<=25){ add('NETS',l,false,[`expected 24 digits, got ${l.length} – verify`]); continue; }
-    if(l.length>=8) add('Unknown',l,false,[`${l.length} digits, format not recognised`]);
+    if(l.startsWith('89') && l.length>=19 && l.length<=21){ add('SIM',l.slice(0,20)); continue; }
+    if(l.length===11 && validDate(+l.slice(6,8),+l.slice(4,6),+l.slice(0,4))){ add('A10',l); continue; }
+    if(l.length>=23 && l.length<=25){ add('NETS',l); continue; }
   }
   return out;
+}
+
+function hamming(a,b){ let d=0; for(let i=0;i<a.length;i++) if(a[i]!==b[i]) d++; return d; }
+// several reads of the same block -> per-position majority vote
+function voteReads(reads){
+  const clusters=[];
+  reads.forEach(items=>items.forEach(it=>{
+    let c=clusters.find(c=>c.type===it.type && c.len===it.n.length && hamming(c.first,it.n)<=Math.floor(it.n.length/3));
+    if(!c){ c={type:it.type,len:it.n.length,first:it.n,members:[]}; clusters.push(c); }
+    c.members.push(it.n);
+  }));
+  return clusters.map(c=>{
+    let n='';
+    for(let i=0;i<c.len;i++){
+      const cnt={}; c.members.forEach(m=>{ cnt[m[i]]=(cnt[m[i]]||0)+1; });
+      n+=Object.keys(cnt).sort((x,y)=>cnt[y]-cnt[x])[0];
+    }
+    return {type:c.type,n,members:c.members.length,agree:c.members.filter(m=>m===n).length};
+  });
+}
+function finalizeCluster(cl){
+  const notes=[], enough=cl.agree>=2 && cl.agree>=0.5*cl.members;
+  let n=cl.n, ok=false;
+  if(cl.type==='SIM'){
+    const f=luhnFix(n);
+    if(f){ n=f.n; ok=true; notes.push(f.fixed?`auto-corrected 1 digit (${f.from}→${f.to} at position ${f.pos+1}) using the check digit`:'check digit OK'); }
+    else notes.push('check digit fails – verify by eye');
+  } else if(cl.type==='T3'){
+    const dv=dateOk8(n.slice(3)); ok=dv&&enough;
+    notes.push(!dv?'date looks wrong – verify':(!enough?'reads disagreed – verify':'date valid'));
+  } else if(cl.type==='A10'){
+    ok=enough; notes.push(enough?'date valid':'reads disagreed – verify');
+  } else if(cl.type==='NETS'){
+    ok=n.length===24 && enough;
+    notes.push(n.length!==24?`expected 24 digits, got ${n.length} – verify`:(enough?'24 digits':'reads disagreed – verify'));
+  }
+  return {type:cl.type,n,ok,notes};
 }
 
 function stretchGray(c){
@@ -438,9 +505,11 @@ function estimateAngle(pts,hmed){
   return 0.5*Math.atan2(sy,sx);
 }
 
-function renderBlock(img, sc, bl, rot, target, M){
+function renderBlock(pyr, sc, bl, rot, target, M){
   M = M||0;
   const f=target/bl.hmed, co=Math.cos(-rot), si=Math.sin(-rot);
+  const hOrig=bl.hmed/sc; let lv=pyr[0];
+  for(const l of pyr){ if(hOrig*l.s>=target) lv=l; }         // deepest level that still has enough detail
   let hx=0, hy=0;
   bl.pts.forEach(p=>{
     const dx=p[0]-bl.cx, dy=p[1]-bl.cy;
@@ -453,20 +522,20 @@ function renderBlock(img, sc, bl, rot, target, M){
   const ctx=c.getContext('2d',{willReadFrequently:true});
   ctx.fillStyle='#fff'; ctx.fillRect(0,0,ow,oh);
   ctx.imageSmoothingQuality='high';
-  if(M){ ctx.beginPath(); ctx.rect(M,M,tw,th); ctx.clip(); }   // keep only the digit block; white margin around it
+  if(M){ ctx.beginPath(); ctx.rect(M,M,tw,th); ctx.clip(); }
   ctx.scale(f,f); ctx.translate(ow/(2*f),oh/(2*f)); ctx.rotate(-rot);
-  ctx.scale(sc,sc); ctx.translate(-bl.cx/sc,-bl.cy/sc);
-  ctx.drawImage(img,0,0);
+  ctx.scale(sc/lv.s,sc/lv.s); ctx.translate(-bl.cx*lv.s/sc,-bl.cy*lv.s/sc);
+  ctx.drawImage(lv.c,0,0);
   stretchGray(c);
   return c;
 }
 
 async function scanNumbers(worker, file, onFrac){
-  const img = await loadImg(file);
-  const results=[], seenNums=new Set(), done=[], jobs=[];
+  const img0 = await loadImg(file), pyr = buildPyramid(img0), base = Math.max(img0.width,img0.height);
+  const jobs=[];
   for(const L of [1600,2400]){
-    const sc=L/Math.max(img.width,img.height);
-    const gc=grayCanvas(img,L), w=gc.width, h=gc.height;
+    const sc=L/base, lv=pickLevel(pyr,L);
+    const gc=grayCanvas(lv.c,L), w=gc.width, h=gc.height;
     const d=gc.getContext('2d',{willReadFrequently:true}).getImageData(0,0,w,h).data;
     const g=new Uint8ClampedArray(w*h);
     for(let i=0;i<w*h;i++) g[i]=d[i*4];
@@ -474,38 +543,56 @@ async function scanNumbers(worker, file, onFrac){
     await new Promise(r=>setTimeout(r,0));
   }
   const readBlock=async (bl,sc,rot,target,M)=>{
-    let text='';
-    try{ text=(await worker.recognize(renderBlock(img,sc,bl,rot,target,M))).data.text; }catch(e){}
-    return interpretText(text);
+    try{
+      const {data}=await worker.recognize(renderBlock(pyr,sc,bl,rot,target,M));
+      return {items:interpretText(data.text), conf:data.confidence||0};
+    }catch(e){ return {items:[], conf:0}; }
   };
+  const results=[], done=[];
   for(let k=0;k<jobs.length;k++){
-    const {bl,sc,L}=jobs[k];
-    const nx=bl.cx/L, ny=bl.cy/L;
+    const {bl,sc,L}=jobs[k], nx=bl.cx/L, ny=bl.cy/L;
     if(!done.some(q=>Math.hypot(q[0]-nx,q[1]-ny)<0.03)){
       const th=estimateAngle(bl.pts,bl.hmed);
       const rots=[th, th+Math.PI, th+Math.PI/2, th-Math.PI/2];
-      let best=null, bestRot=0, bestM=0, valid=false;
-      for(const M of [0,28]){
+      let pick=null, bestTry=null;
+      search: for(const M of [0,28]){
         for(const rot of rots){
-          const found=await readBlock(bl,sc,rot,30,M);
-          if(!found.length) continue;
-          if(!best){ best=found; bestRot=rot; bestM=M; }
-          if(found.some(x=>x.ok)){ best=found; valid=true; break; }
+          const r=await readBlock(bl,sc,rot,40,M);
+          if(!bestTry || r.conf>bestTry.conf) bestTry={rot,M,conf:r.conf};
+          if(r.items.length){
+            if(!pick || r.conf>pick.conf) pick={rot,M,items:r.items,conf:r.conf};
+            if(r.conf>=75) break search;
+          }
         }
-        if(valid) break;
+        if(!pick && (!bestTry || bestTry.conf<30)) break;      // nothing text-like here: don't waste time
       }
-      if(best && !valid){
-        for(const t of [24,38]){
-          const found=await readBlock(bl,sc,bestRot,t,bestM);
-          if(found.some(x=>x.ok)){ best=found; valid=true; break; }
+      if(!pick && bestTry && bestTry.conf>=20){
+        for(const t of [50,64,32]){
+          const r=await readBlock(bl,sc,bestTry.rot,t,bestTry.M);
+          if(r.items.length){ pick={rot:bestTry.rot,M:bestTry.M,items:r.items,conf:r.conf}; break; }
         }
       }
-      if(valid) done.push([nx,ny]);
-      if(best) best.forEach(x=>{ const key=x.type+x.n; if(!seenNums.has(key)){ seenNums.add(key); results.push(x); } });
+      if(pick){
+        let reads=[pick.items];
+        const strong=pick.items.every(x=>x.type==='SIM' && luhnOk(x.n));
+        if(!strong){
+          const more=[];                                          // bigger letter sizes read more reliably
+          for(const [t,M] of [[50,pick.M],[64,pick.M],[46,pick.M],[56,28-pick.M]]){
+            const r=await readBlock(bl,sc,pick.rot,t,M);
+            if(r.items.length) more.push(r.items);
+          }
+          reads = more.length ? more.concat([pick.items]) : reads;
+        }
+        const fin=voteReads(reads).map(finalizeCluster);
+        fin.forEach(x=>{ x.pos=[nx,ny]; results.push(x); });
+        if(fin.length && fin.every(x=>x.ok)) done.push([nx,ny]);
+      } else done.push([nx,ny]);            // nothing readable here – don't retry at the other scale
     }
     onFrac((k+1)/jobs.length);
   }
-  return results;
+  // drop unverified guesses that overlap a verified read of the same spot
+  const good=results.filter(x=>x.ok);
+  return results.filter(x=>x.ok || !good.some(g=>Math.hypot(g.pos[0]-x.pos[0],g.pos[1]-x.pos[1])<0.03));
 }
 
 // ---------- Smarter regular-text OCR ----------
@@ -560,11 +647,11 @@ function binarizeCanvas(src){
   return c;
 }
 async function ocrTextSmart(worker, file, allowBinarize){
-  const img=await loadImg(file), base=Math.max(img.width,img.height);
+  const img=await loadImg(file), base=Math.max(img.width,img.height), pyr=buildPyramid(img);
   const rec=async (L,rot,bin)=>{
-    let c=imgToCanvas(img,L,rot); if(bin) c=binarizeCanvas(c);
+    let c=imgToCanvas(pickLevel(pyr,L).c,L,rot); if(bin) c=binarizeCanvas(c);
     const data=(await worker.recognize(c)).data;
-    return {data,score:textScore(data),L,rot,bin};
+    return {data,score:textScore(data),L,rot,bin,canvas:c};
   };
   let L=Math.min(2000,base);
   let best=await rec(L,0,false);
@@ -586,7 +673,60 @@ async function ocrTextSmart(worker, file, allowBinarize){
   if(allowBinarize && (best.data.confidence||0)<75){            // uneven lighting: try black & white
     const r=await rec(best.L,best.rot,true); if(r.score>best.score*1.05) best=r;
   }
+  if((best.data.confidence||0)<80) return await mergedPasses(worker,best);
   return cleanText(best.data);
+}
+function invertCanvas(src){
+  const c=document.createElement('canvas'); c.width=src.width; c.height=src.height;
+  const x=c.getContext('2d',{willReadFrequently:true}); x.drawImage(src,0,0);
+  const im=x.getImageData(0,0,c.width,c.height), d=im.data;
+  for(let i=0;i<d.length;i+=4){ d[i]=255-d[i]; d[i+1]=255-d[i+1]; d[i+2]=255-d[i+2]; }
+  x.putImageData(im,0,0); return c;
+}
+function wordsToText(ws){
+  if(!ws.length) return '';
+  const mh=medianOf(ws.map(w=>w.bbox.y1-w.bbox.y0)) || 20;
+  ws=[...ws].sort((a,b)=>(a.bbox.y0+a.bbox.y1)-(b.bbox.y0+b.bbox.y1));
+  const rows=[];
+  ws.forEach(w=>{
+    const cy=(w.bbox.y0+w.bbox.y1)/2, r=rows.find(r=>Math.abs(r.cy-cy)<0.55*mh);
+    if(r){ r.w.push(w); r.cy=(r.cy*(r.w.length-1)+cy)/r.w.length; } else rows.push({cy,w:[w]});
+  });
+  rows.sort((a,b)=>a.cy-b.cy);
+  return rows.map(r=>{
+    r.w.sort((a,b)=>a.bbox.x0-b.bbox.x0);
+    let out='', prev=null;
+    r.w.forEach(w=>{ if(prev) out+=(w.bbox.x0-prev.bbox.x1)>2.5*mh?'    ':' '; out+=w.text; prev=w; });
+    return out;
+  }).join('\n');
+}
+// posters / screenshots: combine several reading strategies (scattered text, light-on-dark text)
+async function mergedPasses(worker,best){
+  const runs=[best.data];
+  await worker.setParameters({tessedit_pageseg_mode:'11'});
+  runs.push((await worker.recognize(best.canvas)).data);
+  const inv=invertCanvas(best.canvas);
+  runs.push((await worker.recognize(inv)).data);
+  await worker.setParameters({tessedit_pageseg_mode:'3'});
+  runs.push((await worker.recognize(inv)).data);
+  const cand=[];
+  runs.forEach(d=>(d.words||[]).forEach(w=>{
+    const t=(w.text||'').trim(), alnum=(t.match(/[\p{L}\p{N}]/gu)||[]).length;
+    if(w.bbox && alnum>=1 && ((w.confidence>=50 && alnum>=3) || (w.confidence>=65 && alnum>=2) || w.confidence>=85)) cand.push({text:t,confidence:w.confidence,bbox:w.bbox});
+  }));
+  cand.sort((a,b)=>b.confidence-a.confidence);
+  const kept=[];
+  cand.forEach(w=>{
+    const a=(w.bbox.x1-w.bbox.x0)*(w.bbox.y1-w.bbox.y0);
+    const clash=kept.some(k=>{
+      const ix=Math.min(w.bbox.x1,k.bbox.x1)-Math.max(w.bbox.x0,k.bbox.x0), iy=Math.min(w.bbox.y1,k.bbox.y1)-Math.max(w.bbox.y0,k.bbox.y0);
+      if(ix<=0||iy<=0) return false;
+      const b=(k.bbox.x1-k.bbox.x0)*(k.bbox.y1-k.bbox.y0);
+      return ix*iy > 0.4*Math.min(a,b);
+    });
+    if(!clash) kept.push(w);
+  });
+  return wordsToText(kept);
 }
 const TARGET_H=38;
 
@@ -622,7 +762,7 @@ runBtn.addEventListener('click', async ()=>{
       }
     });
     if(mode==='numbers'){
-      await worker.setParameters({ tessedit_char_whitelist:'HSD0123456789', tessedit_pageseg_mode:'6', user_defined_dpi:'300' });
+      await worker.setParameters({ tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', tessedit_pageseg_mode:'6', user_defined_dpi:'300' });
     } else {
       await worker.setParameters({ preserve_interword_spaces:'1', user_defined_dpi:'300' });
     }
@@ -724,36 +864,40 @@ function localGroup(items){
   return out;
 }
 
-const NUM_TITLES={SIM:'SIM cards',T3:'T3 registers',A10:'A10 registers',NETS:'NETS terminals',Unknown:'Unrecognised numbers',Incomplete:'Incomplete reads'};
+const NUM_TITLES={SIM:'SIM cards',T3:'T3 registers',A10:'A10 registers',NETS:'NETS terminals'};
 function sortKey(type,n){
-  if(type==='T3' && n.length===14) return n.slice(7,11)+n.slice(5,7)+n.slice(3,5)+n.slice(11); // by date, then sequence
+  if(type==='T3' && n.length===14){                       // by prefix, then date, then sequence
+    const p=n.slice(0,3), b=n.slice(3);
+    const dd=p==='HSD'?b.slice(0,2):b.slice(2,4), mm=p==='HSD'?b.slice(2,4):b.slice(0,2);
+    return p+b.slice(4,8)+mm+dd+b.slice(8);
+  }
   return n;
 }
 function numberGroups(extracted){
   const seen=new Map();   // same number in several photos is listed once
   extracted.forEach(ex=>(ex.results||[]).forEach(r=>{
-    const k=r.type+r.n;
-    if(seen.has(k)) seen.get(k).dup++; else { r.dup=0; seen.set(k,r); }
+    const k=r.type+r.n, prev=seen.get(k);
+    if(!prev){ r.dup=0; seen.set(k,r); } else { prev.dup++; if(r.ok && !prev.ok){ r.dup=prev.dup; seen.set(k,r); } }
   }));
-  const all=[...seen.values()];
-  const out=[];
+  const all=[...seen.values()], out=[];
+  const cmp=(t)=>(a,b)=>sortKey(t,a.n)<sortKey(t,b.n)?-1:1;
   Object.keys(NUM_TITLES).forEach(type=>{
-    const rs=all.filter(r=>r.type===type);
+    const rs=all.filter(r=>r.ok && r.type===type).sort(cmp(type));
     if(!rs.length) return;
-    rs.sort((a,b)=>sortKey(type,a.n)<sortKey(type,b.n)?-1:1);
-    const label=(type==='Unknown'||type==='Incomplete')?type:type;
-    out.push({
-      category: NUM_TITLES[type], count: rs.length,
+    out.push({ category:NUM_TITLES[type], count:rs.length,
       items:[{ filename:`${rs.length} number${rs.length===1?'':'s'}, sorted`,
-               text: rs.map(r=>`${label}: ${r.n}`).join('\n'),
-               notes: rs.filter(r=>r.notes.length && !(r.ok)).map(r=>`${r.n} — ${r.notes.join(', ')}`)
+               text: rs.map(r=>`${type}: ${r.n}`).join('\n'),
+               notes: rs.filter(r=>r.notes.some(x=>x.startsWith('auto-corrected'))).map(r=>`${r.n} — ${r.notes.join(', ')}`)
                         .concat(rs.filter(r=>r.dup).map(r=>`${r.n} — seen in ${r.dup+1} photos, listed once`))
-                        .concat(rs.some(r=>r.ok)?[`${rs.filter(r=>r.ok).length} verified by format check`]:[]) }]
-    });
+                        .concat([`${rs.length} verified by format check`]) }]});
   });
+  const bad=all.filter(r=>!r.ok).sort((a,b)=>a.type<b.type?-1:(a.n<b.n?-1:1));
+  if(bad.length) out.push({ category:'Needs checking', count:bad.length,
+    items:[{ filename:'not verified – compare with the label', text: bad.map(r=>`${r.type}: ${r.n}`).join('\n'),
+             notes: bad.map(r=>`${r.n} — ${r.notes.join(', ')}`) }]});
   const empties=extracted.filter(ex=>!(ex.results||[]).length);
   if(empties.length) out.push({category:'No numbers found', count:empties.length,
-    items:[{filename:empties.map(e=>e.filename).join(', '), text:'', notes:['Try a closer, sharper, well-lit photo.']}]});
+    items:[{filename:empties.map(e=>e.filename).join(', '), text:'', notes:['Nothing matching SIM / T3 / A10 / NETS formats. Try a closer, sharper, well-lit photo.']}]});
   return out;
 }
 

@@ -46,7 +46,8 @@
     color:var(--sub); cursor:pointer;
   }
   .drop:active{background:var(--chip);}
-  input[type=file]{display:none;}
+  input[type=file]{position:absolute;width:1px;height:1px;opacity:0;overflow:hidden;pointer-events:none;}
+  .drop{position:relative;display:block;}
   .btnrow{display:flex;gap:10px;margin-top:12px;flex-wrap:wrap;}
   button{
     font:inherit; border:none; border-radius:10px; padding:10px 16px; cursor:pointer;
@@ -156,11 +157,13 @@ function toast(msg){
   setTimeout(()=>toastEl.classList.remove('show'), 1800);
 }
 
-dropZone.addEventListener('click', ()=> fileInput.click());
-fileInput.addEventListener('change', (e)=>{
-  files = files.concat(Array.from(e.target.files));
+fileInput.addEventListener('change', ()=>{
+  const picked = Array.from(fileInput.files || []);
+  if(!picked.length) return;
+  files = files.concat(picked);
   renderThumbs();
-  fileInput.value = '';
+  statusEl.textContent = `${files.length} photo${files.length===1?'':'s'} ready — tap "Extract & sort text".`;
+  setTimeout(()=>{ try{ fileInput.value=''; }catch(e){} }, 500);   // allow picking the same photo again
 });
 
 function renderThumbs(){

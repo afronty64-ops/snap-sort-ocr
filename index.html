@@ -129,7 +129,7 @@
       <button id="copyBtn">📋 Copy all text</button>
     </div>
     <p class="sub" style="margin-top:10px;margin-bottom:0">
-      On a phone, open this same page link in your PC's browser (or use Save/Copy above) to get the text onto your computer.
+      This device only — results aren't shared between devices. Use Save or Copy above, then send that to your PC (email it to yourself, AirDrop, a cloud drive, etc.). Opening this same link on your PC starts a fresh, empty scan, it won't show these results.
     </p>
   </div>
 </div>
@@ -254,14 +254,12 @@ function cleanText(data){
 
 // ---------- Numbers & codes mode ----------
 function luhnOk(d){
-  if(!/^\d+$/.test(d)) return false;
   let sum=0, alt=false;
   for(let i=d.length-1;i>=0;i--){
     let n=+d[i]; if(alt){ n*=2; if(n>9) n-=9; } sum+=n; alt=!alt;
   }
   return sum%10===0;
 }
-function validSim(n){ return /^89\d{17,18}$/.test(n) && luhnOk(n); }
 
 function grayCanvas(bmp, longSide){
   const sc = longSide/Math.max(bmp.width,bmp.height);
@@ -363,6 +361,17 @@ function pickLevel(pyr,minLong){
   for(const lv of pyr){ if(Math.max(lv.c.width,lv.c.height)>=minLong) best=lv; }
   return best;
 }
+function luhnFix(n){
+  if(luhnOk(n)) return {n,fixed:false};
+  const CONF={'0':'869','1':'7','2':'7','3':'58','5':'368','6':'580','7':'12','8':'0369','9':'80'};
+  const cands=[];
+  for(let i=0;i<n.length;i++) for(const alt of (CONF[n[i]]||'')){
+    const m=n.slice(0,i)+alt+n.slice(i+1);
+    if(m.startsWith('89') && luhnOk(m)) cands.push({n:m,fixed:true,pos:i,from:n[i],to:alt});
+  }
+  return cands.length===1 ? cands[0] : null;
+}
+
 function validDate(d,m,y){ return y>=2000 && y<=2099 && m>=1 && m<=12 && d>=1 && d<=31; }
 
 // Recognise number formats:
@@ -406,11 +415,11 @@ function interpretText(text){
       const grp=lines.slice(i,i+4);
       if(grp.length===4 && grp.every(numeric)){
         const num=grp.map(mapDigits).join('');
-        if(num.length>=18 && num.length<=22){ add('SIM',num); i+=3; }
+        if(num.length===19 || num.length===20) add('SIM',num);
       }
-      continue;
+      i+=3; continue;
     }
-    if(l.startsWith('89') && l.length>=18 && l.length<=22){ add('SIM',l); continue; }
+    if(l.startsWith('89') && (l.length===19 || l.length===20)){ add('SIM',l); continue; }
     if(l.length===11 && validDate(+l.slice(6,8),+l.slice(4,6),+l.slice(0,4))){ add('A10',l); continue; }
     if(l.length>=23 && l.length<=25){ add('NETS',l); continue; }
   }
@@ -439,10 +448,9 @@ function finalizeCluster(cl){
   const notes=[], enough=cl.agree>=2 && cl.agree>=0.5*cl.members;
   let n=cl.n, ok=false;
   if(cl.type==='SIM'){
-    ok=validSim(n);
-    if(!/^89\d+$/.test(n)) notes.push('expected digits starting with 89 – verify by eye');
-    else if(n.length!==19 && n.length!==20) notes.push(`expected 19 or 20 digits, got ${n.length} – verify by eye`);
-    else notes.push(ok?'check digit OK':'check digit fails – verify by eye');
+    const f=luhnFix(n);
+    if(f){ n=f.n; ok=true; notes.push(f.fixed?`auto-corrected 1 digit (${f.from}→${f.to} at position ${f.pos+1}) using the check digit`:'check digit OK'); }
+    else notes.push('check digit fails – verify by eye');
   } else if(cl.type==='T3'){
     const dv=dateOk8(n.slice(3)); ok=dv&&enough;
     notes.push(!dv?'date looks wrong – verify':(!enough?'reads disagreed – verify':'date valid'));
@@ -524,70 +532,82 @@ function renderBlock(pyr, sc, bl, rot, target, M){
 
 async function scanNumbers(worker, file, onFrac){
   const img0 = await loadImg(file), pyr = buildPyramid(img0), base = Math.max(img0.width,img0.height);
-  const jobs=[];
+  const raw=[];
   for(const L of [1600,2400]){
     const sc=L/base, lv=pickLevel(pyr,L);
     const gc=grayCanvas(lv.c,L), w=gc.width, h=gc.height;
     const d=gc.getContext('2d',{willReadFrequently:true}).getImageData(0,0,w,h).data;
     const g=new Uint8ClampedArray(w*h);
     for(let i=0;i<w*h;i++) g[i]=d[i*4];
-    findDigitBlocks(g,w,h).forEach(bl=>jobs.push({bl,sc,L}));
+    findDigitBlocks(g,w,h).forEach(bl=>raw.push({bl,sc,nx:bl.cx/L,ny:bl.cy/L}));
     await new Promise(r=>setTimeout(r,0));
   }
+  // one physical label can be detected at both zoom levels — merge those into a single block to scan once
+  const groups=[];
+  raw.forEach(it=>{
+    let g=groups.find(g=>Math.hypot(g.nx-it.nx,g.ny-it.ny)<0.035);
+    if(!g){ g={nx:it.nx,ny:it.ny,variants:[]}; groups.push(g); }
+    g.variants.push(it);
+  });
   const readBlock=async (bl,sc,rot,target,M)=>{
     try{
       const {data}=await worker.recognize(renderBlock(pyr,sc,bl,rot,target,M));
       return {items:interpretText(data.text), conf:data.confidence||0};
     }catch(e){ return {items:[], conf:0}; }
   };
-  const results=[], done=[];
-  for(let k=0;k<jobs.length;k++){
-    const {bl,sc,L}=jobs[k], nx=bl.cx/L, ny=bl.cy/L;
-    if(!done.some(q=>Math.hypot(q[0]-nx,q[1]-ny)<0.03)){
-      const th=estimateAngle(bl.pts,bl.hmed);
-      const rots=[th, th+Math.PI, th+Math.PI/2, th-Math.PI/2];
-      let pick=null, bestTry=null;
-      search: for(const M of [0,28]){
-        for(const rot of rots){
-          const r=await readBlock(bl,sc,rot,40,M);
-          if(!bestTry || r.conf>bestTry.conf) bestTry={rot,M,conf:r.conf};
+  const results=[];
+  for(let k=0;k<groups.length;k++){
+    const g=groups[k], primary=g.variants[0];
+    const th=estimateAngle(primary.bl.pts,primary.bl.hmed);
+    const rots=[th, th+Math.PI, th+Math.PI/2, th-Math.PI/2];
+    let pick=null, bestTry=null;
+    search: for(const v of g.variants){
+      for(const M of [0,28]){
+        for(const rot of [th, th+Math.PI, th+Math.PI/2, th-Math.PI/2]){
+          const r=await readBlock(v.bl,v.sc,rot,40,M);
+          if(!bestTry || r.conf>bestTry.conf) bestTry={v,rot,M,conf:r.conf};
           if(r.items.length){
-            if(!pick || r.conf>pick.conf) pick={rot,M,items:r.items,conf:r.conf};
+            if(!pick || r.conf>pick.conf) pick={v,rot,M,items:r.items,conf:r.conf};
             if(r.conf>=75) break search;
           }
         }
-        if(!pick && (!bestTry || bestTry.conf<30)) break;      // nothing text-like here: don't waste time
       }
-      if(!pick && bestTry && bestTry.conf>=20){
-        for(const t of [50,64,32]){
-          const r=await readBlock(bl,sc,bestTry.rot,t,bestTry.M);
-          if(r.items.length){ pick={rot:bestTry.rot,M:bestTry.M,items:r.items,conf:r.conf}; break; }
-        }
-      }
-      if(pick){
-        let reads=[pick.items];
-        const strong=pick.items.every(x=>x.type==='SIM' && validSim(x.n));
-        if(!strong){
-          const more=[];                                          // bigger letter sizes read more reliably
-          for(const [t,M] of [[50,pick.M],[64,pick.M],[46,pick.M],[56,28-pick.M]]){
-            const r=await readBlock(bl,sc,pick.rot,t,M);
-            if(r.items.length) more.push(r.items);
-          }
-          reads = more.length ? more.concat([pick.items]) : reads;
-        }
-        const fin=voteReads(reads).map(finalizeCluster);
-        fin.forEach(x=>{ x.pos=[nx,ny]; results.push(x); });
-        if(fin.length && fin.every(x=>x.ok)) done.push([nx,ny]);
-      } else done.push([nx,ny]);            // nothing readable here – don't retry at the other scale
+      if(!pick && (!bestTry || bestTry.conf<30)) break;
     }
-    onFrac((k+1)/jobs.length);
+    if(!pick && bestTry && bestTry.conf>=20){
+      for(const t of [50,64,32]){
+        const r=await readBlock(bestTry.v.bl,bestTry.v.sc,bestTry.rot,t,bestTry.M);
+        if(r.items.length){ pick={v:bestTry.v,rot:bestTry.rot,M:bestTry.M,items:r.items,conf:r.conf}; break; }
+      }
+    }
+    if(pick){
+      let reads=[pick.items];
+      const strong=pick.items.every(x=>x.type==='SIM' && luhnOk(x.n));
+      if(!strong){
+        const more=[];
+        for(const [t,M] of [[50,pick.M],[64,pick.M],[46,pick.M],[56,28-pick.M]]){
+          const r=await readBlock(pick.v.bl,pick.v.sc,pick.rot,t,M);
+          if(r.items.length) more.push(r.items);
+        }
+        reads = more.length ? more.concat([pick.items]) : reads;
+      }
+      const byType={};
+      voteReads(reads).forEach(cl=>{ (byType[cl.type]=byType[cl.type]||[]).push(cl); });
+      Object.values(byType).forEach(clusters=>{
+        clusters.sort((a,b)=>(b.agree-a.agree)||(b.members-a.members));  // one best candidate per type per block
+        const fin=finalizeCluster(clusters[0]);
+        fin.pos=[g.nx,g.ny];
+        results.push(fin);
+      });
+    }
+    onFrac((k+1)/groups.length);
   }
-  // drop unverified guesses that overlap a verified read of the same spot
   const good=results.filter(x=>x.ok);
-  return results.filter(x=>x.ok || !good.some(g=>Math.hypot(g.pos[0]-x.pos[0],g.pos[1]-x.pos[1])<0.03));
+  return results.filter(x=>x.ok || !good.some(gg=>Math.hypot(gg.pos[0]-x.pos[0],gg.pos[1]-x.pos[1])<0.035));
 }
 
 // ---------- Smarter regular-text OCR ----------
+const TARGET_H=38;
 function medianOf(a){ if(!a.length) return 0; const b=[...a].sort((x,y)=>x-y); return b[b.length>>1]; }
 function textScore(data){
   let n=0;
@@ -638,36 +658,6 @@ function binarizeCanvas(src){
   ctx.putImageData(img,0,0);
   return c;
 }
-async function ocrTextSmart(worker, file, allowBinarize){
-  const img=await loadImg(file), base=Math.max(img.width,img.height), pyr=buildPyramid(img);
-  const rec=async (L,rot,bin)=>{
-    let c=imgToCanvas(pickLevel(pyr,L).c,L,rot); if(bin) c=binarizeCanvas(c);
-    const data=(await worker.recognize(c)).data;
-    return {data,score:textScore(data),L,rot,bin,canvas:c};
-  };
-  let L=Math.min(2000,base);
-  let best=await rec(L,0,false);
-  if(best.score<40 || (best.data.confidence||0)<50){          // maybe sideways / upside down
-    for(const deg of [90,180,270]){ const r=await rec(L,deg,false); if(r.score>best.score*1.2+10) best=r; }
-  }
-  const tilt=tiltDegrees(best.data);                            // straighten slightly tilted pages
-  if(Math.abs(tilt)>1.2 && Math.abs(tilt)<30){
-    const r=await rec(best.L,best.rot-tilt,false); if(r.score>=best.score*0.95) best=r;
-  }
-  const mh=medWordHeight(best.data);                            // rescale so letters are a good size
-  if(mh>0){
-    const ratio=TARGET_H/mh;
-    if(ratio<0.75 || ratio>1.35){
-      const L2=Math.max(1000,Math.min(3600,base*2.5,best.L*ratio));
-      const r=await rec(L2,best.rot,false); if(r.score>best.score) best=r;
-    }
-  }
-  if(allowBinarize && (best.data.confidence||0)<75){            // uneven lighting: try black & white
-    const r=await rec(best.L,best.rot,true); if(r.score>best.score*1.05) best=r;
-  }
-  if((best.data.confidence||0)<80) return await mergedPasses(worker,best);
-  return cleanText(best.data);
-}
 function invertCanvas(src){
   const c=document.createElement('canvas'); c.width=src.width; c.height=src.height;
   const x=c.getContext('2d',{willReadFrequently:true}); x.drawImage(src,0,0);
@@ -692,7 +682,6 @@ function wordsToText(ws){
     return out;
   }).join('\n');
 }
-// posters / screenshots: combine several reading strategies (scattered text, light-on-dark text)
 async function mergedPasses(worker,best){
   const runs=[best.data];
   await worker.setParameters({tessedit_pageseg_mode:'11'});
@@ -720,8 +709,36 @@ async function mergedPasses(worker,best){
   });
   return wordsToText(kept);
 }
-const TARGET_H=38;
-
+async function ocrTextSmart(worker, file, allowBinarize){
+  const img=await loadImg(file), base=Math.max(img.width,img.height), pyr=buildPyramid(img);
+  const rec=async (L,rot,bin)=>{
+    let c=imgToCanvas(pickLevel(pyr,L).c,L,rot); if(bin) c=binarizeCanvas(c);
+    const data=(await worker.recognize(c)).data;
+    return {data,score:textScore(data),L,rot,bin,canvas:c};
+  };
+  let L=Math.min(2000,base);
+  let best=await rec(L,0,false);
+  if(best.score<40 || (best.data.confidence||0)<50){
+    for(const deg of [90,180,270]){ const r=await rec(L,deg,false); if(r.score>best.score*1.2+10) best=r; }
+  }
+  const tilt=tiltDegrees(best.data);
+  if(Math.abs(tilt)>1.2 && Math.abs(tilt)<30){
+    const r=await rec(best.L,best.rot-tilt,false); if(r.score>=best.score*0.95) best=r;
+  }
+  const mh=medWordHeight(best.data);
+  if(mh>0){
+    const ratio=TARGET_H/mh;
+    if(ratio<0.75 || ratio>1.35){
+      const L2=Math.max(1000,Math.min(3600,base*2.5,best.L*ratio));
+      const r=await rec(L2,best.rot,false); if(r.score>best.score) best=r;
+    }
+  }
+  if(allowBinarize && (best.data.confidence||0)<75){
+    const r=await rec(best.L,best.rot,true); if(r.score>best.score*1.05) best=r;
+  }
+  if((best.data.confidence||0)<80) return await mergedPasses(worker,best);
+  return cleanText(best.data);
+}
 async function plainCanvas(file){
   const im=await loadImg(file), sc=Math.min(1, 2400/Math.max(im.width,im.height));
   const c=document.createElement('canvas'); c.width=Math.round(im.width*sc); c.height=Math.round(im.height*sc);
@@ -823,7 +840,6 @@ async function categorize(items){
   return localGroup(items);
 }
 
-// Fallback: simple keyword-overlap grouping, no AI needed
 function localGroup(items){
   const stop = new Set(['the','and','for','with','this','that','from','have','are','was','were','you','your','of','to','a','in','on','is','it','be','as','at','an']);
   function keywords(text){

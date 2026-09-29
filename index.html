@@ -894,7 +894,7 @@ function numberGroups(extracted){
     if(!rs.length) return;
     out.push({ category:NUM_TITLES[type], count:rs.length,
       items:[{ filename:`${rs.length} number${rs.length===1?'':'s'}, sorted`,
-               text: rs.map(r=>`${type}: ${r.n}`).join('\n'),
+               text: rs.map(r=>r.n).join('\n'),
                notes: rs.filter(r=>r.notes.some(x=>x.startsWith('auto-corrected'))).map(r=>`${r.n} — ${r.notes.join(', ')}`)
                         .concat(rs.filter(r=>r.dup).map(r=>`${r.n} — seen in ${r.dup+1} photos, listed once`))
                         .concat([`${rs.length} verified by format check`]) }]});

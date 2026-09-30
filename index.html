@@ -93,12 +93,6 @@
     </label>
     <div class="thumbs" id="thumbs"></div>
     <div class="opts">
-      <label>Mode
-        <select id="modeSel">
-          <option value="numbers">Numbers &amp; codes (SIM cards, serials)</option>
-          <option value="text">Text (notes, documents)</option>
-        </select>
-      </label>
       <label>Language
         <select id="langSel">
           <option value="eng">English</option>
@@ -151,7 +145,6 @@ const toastEl = document.getElementById('toast');
 
 let files = [];
 let groups = null;
-let modeUsed = 'text'; // [{category, items:[{filename, text}]}]
 
 function toast(msg){
   toastEl.textContent = msg;
@@ -391,37 +384,45 @@ function lev(a,b){
 }
 function interpretText(text){
   const lines=(text||'').toUpperCase().split(/\n+/).map(l=>l.replace(/[^A-Z0-9]/g,'')).filter(l=>l.length>=3);
-  const out=[], add=(type,n)=>out.push({type,n});
+  const out=[], add=(type,n)=>out.push({type,n}), used=new Set();
   const numeric=x=>/^[0-9OSDILBZ]{3,}$/.test(x);
   for(let i=0;i<lines.length;i++){
     let l=lines[i];
     const m=l.match(/([A-Z0-9]{3})([0-9]{11})$/);
     if(m && (m[1].match(/[A-Z]/g)||[]).length>=2){
       add('T3', m[1].replace(/0/g,'O').replace(/5/g,'S').replace(/8/g,'B').replace(/1/g,'I')+m[2]);
-      continue;
+      used.add(i); continue;
     }
     if(l.length>=13 && l.length<=15){
       const body=mapDigits(l.slice(-11).replace(/Q/g,'0').replace(/G/g,'6')), pre=l.slice(0,l.length-11);
       if(/^[0-9]{11}$/.test(body) && dateOk8(body.slice(0,8)) && /^[A-Z0-9]{2,4}$/.test(pre) && (pre.match(/[A-Z]/g)||[]).length>=1){
         let best=null, bd=9;
         for(const k of KNOWN_T3){ const d=lev(pre,k); if(d<bd){bd=d;best=k;} }
-        if(best && bd<=2){ add('T3',best+body); continue; }
+        if(best && bd<=2){ add('T3',best+body); used.add(i); continue; }
       }
     }
-    l=l.replace(/^[A-Z]{1,4}(?=[0-9OSDILBZ]{8})/,'');
-    if(!numeric(l)) continue;
-    l=mapDigits(l);
-    if(l.startsWith('89') && l.length<18){                       // SIM stacked over 4 short lines
-      const grp=lines.slice(i,i+4);
-      if(grp.length===4 && grp.every(numeric)){
-        const num=grp.map(mapDigits).join('');
-        if(num.length===19 || num.length===20) add('SIM',num);
+    const stripped=l.replace(/^[A-Z]{1,4}(?=[0-9OSDILBZ]{8})/,'');
+    if(numeric(stripped)){
+      const mapped=mapDigits(stripped);
+      if(mapped.startsWith('89') && mapped.length<18){             // SIM stacked over 4 short lines
+        const grp=lines.slice(i,i+4);
+        if(grp.length===4 && grp.every(numeric)){
+          const num=grp.map(mapDigits).join('');
+          if(num.length===19 || num.length===20){ add('SIM',num); for(let j=i;j<i+4;j++) used.add(j); }
+        }
+        i+=3; continue;
       }
-      i+=3; continue;
+      if(mapped.startsWith('89') && (mapped.length===19 || mapped.length===20)){ add('SIM',mapped); used.add(i); continue; }
+      if(mapped.length===11 && validDate(+mapped.slice(6,8),+mapped.slice(4,6),+mapped.slice(0,4))){ add('A10',mapped); used.add(i); continue; }
+      if(mapped.length>=23 && mapped.length<=25){ add('NETS',mapped); used.add(i); continue; }
     }
-    if(l.startsWith('89') && (l.length===19 || l.length===20)){ add('SIM',l); continue; }
-    if(l.length===11 && validDate(+l.slice(6,8),+l.slice(4,6),+l.slice(0,4))){ add('A10',l); continue; }
-    if(l.length>=23 && l.length<=25){ add('NETS',l); continue; }
+  }
+  // anything left over that still looks like a serial/code (mix of letters+digits, plausible length)
+  // goes in unrecognised rather than being dropped, per the user's request
+  for(let i=0;i<lines.length;i++){
+    if(used.has(i)) continue;
+    const l=lines[i], digits=(l.match(/[0-9]/g)||[]).length, letters=(l.match(/[A-Z]/g)||[]).length;
+    if(l.length>=6 && l.length<=30 && digits>=3 && digits+letters===l.length && !/^0+$/.test(l)) add('Other',l);
   }
   return out;
 }
@@ -459,6 +460,8 @@ function finalizeCluster(cl){
   } else if(cl.type==='NETS'){
     ok=n.length===24 && enough;
     notes.push(n.length!==24?`expected 24 digits, got ${n.length} – verify`:(enough?'24 digits':'reads disagreed – verify'));
+  } else if(cl.type==='Other'){
+    ok=enough; notes.push(enough?'format not recognised':'reads disagreed – verify');
   }
   return {type:cl.type,n,ok,notes};
 }
@@ -756,40 +759,41 @@ runBtn.addEventListener('click', async ()=>{
   progressEl.value = 0;
   const lang = document.getElementById('langSel').value;
   const enhance = document.getElementById('enhanceChk').checked;
-  const mode = document.getElementById('modeSel').value;
   const extracted = [];
   let worker = null;
   let curIdx = 0;
   let lastErr = null;
   try{
     statusEl.textContent = 'Loading OCR engine (first time takes a moment)…';
-    worker = await Tesseract.createWorker(mode==='numbers' ? 'eng' : lang, 1, {
+    worker = await Tesseract.createWorker(lang, 1, {
       logger: m=>{
-        if(m.status==='recognizing text' && mode==='text'){
+        if(m.status==='recognizing text'){
           progressEl.value = (curIdx + m.progress) / files.length;
         }
       }
     });
-    if(mode==='numbers'){
-      await worker.setParameters({ tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', tessedit_pageseg_mode:'6', user_defined_dpi:'300' });
-    } else {
-      await worker.setParameters({ preserve_interword_spaces:'1', user_defined_dpi:'300' });
-    }
     for (let i=0; i<files.length; i++){
       curIdx = i;
-      statusEl.textContent = `Reading photo ${i+1} of ${files.length}…`;
       const name = files[i].name || `photo-${i+1}`;
       try{
-        if(mode==='numbers'){
-          const res = await scanNumbers(worker, files[i], f=>{ progressEl.value=(i+f)/files.length; });
-          extracted.push({ filename: name, results: res, text: '' });
-        } else {
-          const txt = await ocrTextSmart(worker, files[i], enhance);
-          extracted.push({ filename: name, text: txt });
-        }
+        statusEl.textContent = `Reading photo ${i+1} of ${files.length} — codes…`;
+        await worker.setParameters({ tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', tessedit_pageseg_mode:'6', user_defined_dpi:'300' });
+        const results = await scanNumbers(worker, files[i], f=>{ progressEl.value=(i+f*0.6)/files.length; });
+
+        statusEl.textContent = `Reading photo ${i+1} of ${files.length} — text…`;
+        await worker.setParameters({ tessedit_char_whitelist:'', preserve_interword_spaces:'1', tessedit_pageseg_mode:'3', user_defined_dpi:'300' });
+        let text = '';
+        try{
+          const t = await ocrTextSmart(worker, files[i], enhance);
+          const letterRun = (t.match(/[A-Za-z]{3,}/g)||[]).join('').length;   // skip near-empty / noise-only reads
+          if(letterRun >= 12) text = t;
+        }catch(e){ /* text pass is best-effort; codes above already succeeded or failed independently */ }
+
+        progressEl.value = (i+1)/files.length;
+        extracted.push({ filename: name, results, text });
       }catch(err){
         lastErr = err;
-        extracted.push({ filename: name, text: '' });
+        extracted.push({ filename: name, results: [], text: '' });
       }
     }
   }catch(err){
@@ -801,19 +805,26 @@ runBtn.addEventListener('click', async ()=>{
     if(worker){ try{ await worker.terminate(); }catch(e){} }
   }
   progressEl.value = 1;
-  statusEl.textContent = 'Grouping by topic…';
-  modeUsed = mode;
-  groups = mode==='numbers' ? numberGroups(extracted) : await categorize(extracted);
+  statusEl.textContent = 'Sorting results…';
+  const codeGroups = numberGroups(extracted);
+  const textPhotos = extracted.filter(ex=>ex.text);
+  const textGroups = textPhotos.length ? await categorize(textPhotos) : [];
+  const nothing = extracted.filter(ex=>!(ex.results||[]).length && !ex.text);
+  groups = codeGroups.concat(textGroups);
+  if(nothing.length) groups.push({ category:'Nothing found', kind:'text', count:nothing.length,
+    items:[{ filename:nothing.map(e=>e.filename).join(', '), text:'',
+             notes:['Try a closer, sharper, well-lit photo.'] }] });
   renderResults();
-  statusEl.textContent = lastErr ? `Some photos failed: ${lastErr.message||lastErr}. ` : ''; statusEl.textContent += `Done — ${extracted.length} photo${extracted.length===1?'':'s'} processed. If the text looks wrong, try toggling "Enhance image" or the language.`;
+  statusEl.textContent = lastErr ? `Some photos failed: ${lastErr.message||lastErr}. ` : ''; statusEl.textContent += `Done — ${extracted.length} photo${extracted.length===1?'':'s'} processed. If something looks wrong, try toggling "Enhance image" or the language.`;
   progressEl.style.display = 'none';
   runBtn.disabled = false;
   exportCard.style.display = 'block';
 });
 
+
 async function categorize(items){
   const nonEmpty = items.filter(it=>it.text.length>0);
-  if(nonEmpty.length===0) return [{category:'No text found', items}];
+  if(nonEmpty.length===0) return [{category:'No text found', kind:'text', items}];
 
   let sample = null;
   try{ sample = await claude.use('sample'); }catch(e){ sample = null; }
@@ -826,13 +837,13 @@ async function categorize(items){
       if(Array.isArray(parsed)){
         const used = new Set();
         const out = parsed.map(g=>({
-          category: g.category || 'Other',
+          category: g.category || 'Other', kind:'text',
           items: (g.indices||[]).filter(i=>nonEmpty[i]&&!used.has(i)).map(i=>{used.add(i);return nonEmpty[i];})
         })).filter(g=>g.items.length);
         const leftover = nonEmpty.filter((_,i)=>!used.has(i));
-        if(leftover.length) out.push({category:'Other', items: leftover});
+        if(leftover.length) out.push({category:'Other', kind:'text', items: leftover});
         const emptyOnes = items.filter(it=>it.text.length===0);
-        if(emptyOnes.length) out.push({category:'No text found', items: emptyOnes});
+        if(emptyOnes.length) out.push({category:'No text found', kind:'text', items: emptyOnes});
         return out;
       }
     }catch(e){ /* fall through to local grouping */ }
@@ -865,10 +876,10 @@ function localGroup(items){
     const freq = {};
     c.kw.forEach(w=>{ freq[w] = (freq[w]||0)+1; });
     const top = Object.keys(freq).sort((a,b)=>freq[b]-freq[a]).slice(0,2);
-    return { category: top.length? top.map(w=>w[0].toUpperCase()+w.slice(1)).join(' & ') : `Group ${i+1}`, items: c.items };
+    return { category: top.length? top.map(w=>w[0].toUpperCase()+w.slice(1)).join(' & ') : `Group ${i+1}`, kind:'text', items: c.items };
   });
   const emptyOnes = items.filter(it=>it.text.length===0);
-  if(emptyOnes.length) out.push({category:'No text found', items: emptyOnes});
+  if(emptyOnes.length) out.push({category:'No text found', kind:'text', items: emptyOnes});
   return out;
 }
 
@@ -892,22 +903,25 @@ function numberGroups(extracted){
   Object.keys(NUM_TITLES).forEach(type=>{
     const rs=all.filter(r=>r.ok && r.type===type).sort(cmp(type));
     if(!rs.length) return;
-    out.push({ category:NUM_TITLES[type], count:rs.length,
+    out.push({ category:NUM_TITLES[type], count:rs.length, kind:'code',
       items:[{ filename:`${rs.length} number${rs.length===1?'':'s'}, sorted`,
                text: rs.map(r=>r.n).join('\n'),
                notes: rs.filter(r=>r.notes.some(x=>x.startsWith('auto-corrected'))).map(r=>`${r.n} — ${r.notes.join(', ')}`)
                         .concat(rs.filter(r=>r.dup).map(r=>`${r.n} — seen in ${r.dup+1} photos, listed once`))
                         .concat([`${rs.length} verified by format check`]) }]});
   });
-  const bad=all.filter(r=>!r.ok).sort((a,b)=>a.type<b.type?-1:(a.n<b.n?-1:1));
-  if(bad.length) out.push({ category:'Needs checking', count:bad.length,
+  const other=all.filter(r=>r.ok && r.type==='Other').sort((a,b)=>a.n<b.n?-1:1);
+  if(other.length) out.push({ category:'Uncategorized', count:other.length, kind:'code',
+    items:[{ filename:`${other.length} number${other.length===1?'':'s'} — format not recognised`,
+             text: other.map(r=>r.n).join('\n'),
+             notes: other.filter(r=>r.dup).map(r=>`${r.n} — seen in ${r.dup+1} photos, listed once`) }]});
+  const bad=all.filter(r=>!r.ok && r.type!=='Other').sort((a,b)=>a.type<b.type?-1:(a.n<b.n?-1:1));
+  if(bad.length) out.push({ category:'Needs checking', count:bad.length, kind:'code',
     items:[{ filename:'not verified – compare with the label', text: bad.map(r=>`${r.type}: ${r.n}`).join('\n'),
              notes: bad.map(r=>`${r.n} — ${r.notes.join(', ')}`) }]});
-  const empties=extracted.filter(ex=>!(ex.results||[]).length);
-  if(empties.length) out.push({category:'No numbers found', count:empties.length,
-    items:[{filename:empties.map(e=>e.filename).join(', '), text:'', notes:['Nothing matching SIM / T3 / A10 / NETS formats. Try a closer, sharper, well-lit photo.']}]});
   return out;
 }
+
 
 function renderResults(){
   resultsEl.innerHTML = '';
@@ -919,6 +933,7 @@ function renderResults(){
     const sec = document.createElement('div');
     sec.className = 'cat';
     sec.innerHTML = `<h2>${escapeHtml(g.category)} <span class="n">${g.count ?? g.items.length}</span></h2>`;
+    sec.dataset.kind = g.kind || (g.count!==undefined ? 'code' : 'text');
     g.items.forEach(it=>{
       const e = document.createElement('div');
       e.className = 'entry';
@@ -939,18 +954,18 @@ function escapeHtml(s){
 function assembleText(){
   if(!groups) return '';
   // clean text only (no notes / check marks); reads current textarea values so edits are kept
-  const num = modeUsed==='numbers';
   let out = '';
   resultsEl.querySelectorAll('.cat').forEach(catEl=>{
     const title = catEl.querySelector('h2').firstChild.textContent.trim();
+    const isCode = catEl.dataset.kind==='code';
     const blocks = [];
     catEl.querySelectorAll('.entry').forEach(entry=>{
       const text = entry.querySelector('textarea').value.trim();
       if(!text) return;
-      blocks.push(num ? text : `[${entry.querySelector('.fname').textContent}]\n${text}`);
+      blocks.push(isCode ? text : `[${entry.querySelector('.fname').textContent}]\n${text}`);
     });
     if(!blocks.length) return;
-    out += `## ${title}\n\n${blocks.join(num ? '\n' : '\n\n')}\n\n`;
+    out += `## ${title}\n\n${blocks.join(isCode ? '\n' : '\n\n')}\n\n`;
   });
   return out.trim() + '\n';
 }
@@ -958,7 +973,7 @@ function assembleText(){
 copyBtn.addEventListener('click', async ()=>{
   try{
     await navigator.clipboard.writeText(assembleText());
-    toast('Copied — paste it anywhere, including on your PC.');
+    toast('Success');
   }catch(e){
     toast('Could not copy — try Save instead.');
   }

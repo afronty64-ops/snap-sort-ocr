@@ -533,81 +533,104 @@ function renderBlock(pyr, sc, bl, rot, target, M){
   return c;
 }
 
-async function scanNumbers(worker, file, onFrac){
-  const img0 = await loadImg(file), pyr = buildPyramid(img0), base = Math.max(img0.width,img0.height);
-  const raw=[];
-  for(const L of [1600,2400]){
-    const sc=L/base, lv=pickLevel(pyr,L);
-    const gc=grayCanvas(lv.c,L), w=gc.width, h=gc.height;
-    const d=gc.getContext('2d',{willReadFrequently:true}).getImageData(0,0,w,h).data;
-    const g=new Uint8ClampedArray(w*h);
-    for(let i=0;i<w*h;i++) g[i]=d[i*4];
-    findDigitBlocks(g,w,h).forEach(bl=>raw.push({bl,sc,nx:bl.cx/L,ny:bl.cy/L}));
-    await new Promise(r=>setTimeout(r,0));
-  }
-  // one physical label can be detected at both zoom levels — merge those into a single block to scan once
-  const groups=[];
-  raw.forEach(it=>{
-    let g=groups.find(g=>Math.hypot(g.nx-it.nx,g.ny-it.ny)<0.035);
-    if(!g){ g={nx:it.nx,ny:it.ny,variants:[]}; groups.push(g); }
-    g.variants.push(it);
-  });
+async function scanLabelGroup(worker, pyr, g){
+  const th=estimateAngle(g.variants[0].bl.pts, g.variants[0].bl.hmed);
   const readBlock=async (bl,sc,rot,target,M)=>{
     try{
       const {data}=await worker.recognize(renderBlock(pyr,sc,bl,rot,target,M));
       return {items:interpretText(data.text), conf:data.confidence||0};
     }catch(e){ return {items:[], conf:0}; }
   };
-  const results=[];
-  for(let k=0;k<groups.length;k++){
-    const g=groups[k], primary=g.variants[0];
-    const th=estimateAngle(primary.bl.pts,primary.bl.hmed);
-    const rots=[th, th+Math.PI, th+Math.PI/2, th-Math.PI/2];
-    let pick=null, bestTry=null;
-    search: for(const v of g.variants){
-      for(const M of [0,28]){
-        for(const rot of [th, th+Math.PI, th+Math.PI/2, th-Math.PI/2]){
-          const r=await readBlock(v.bl,v.sc,rot,40,M);
-          if(!bestTry || r.conf>bestTry.conf) bestTry={v,rot,M,conf:r.conf};
-          if(r.items.length){
-            if(!pick || r.conf>pick.conf) pick={v,rot,M,items:r.items,conf:r.conf};
-            if(r.conf>=75) break search;
-          }
+  let pick=null, bestTry=null;
+  search: for(const v of g.variants){
+    for(const M of [0,28]){
+      for(const rot of [th, th+Math.PI, th+Math.PI/2, th-Math.PI/2]){
+        const r=await readBlock(v.bl,v.sc,rot,40,M);
+        if(!bestTry || r.conf>bestTry.conf) bestTry={v,rot,M,conf:r.conf};
+        if(r.items.length){
+          if(!pick || r.conf>pick.conf) pick={v,rot,M,items:r.items,conf:r.conf};
+          if(r.conf>=75) break search;
         }
       }
-      if(!pick && (!bestTry || bestTry.conf<30)) break;
     }
-    if(!pick && bestTry && bestTry.conf>=20){
-      for(const t of [50,64,32]){
-        const r=await readBlock(bestTry.v.bl,bestTry.v.sc,bestTry.rot,t,bestTry.M);
-        if(r.items.length){ pick={v:bestTry.v,rot:bestTry.rot,M:bestTry.M,items:r.items,conf:r.conf}; break; }
-      }
-    }
-    if(pick){
-      let reads=[pick.items];
-      const strong=pick.items.every(x=>x.type==='SIM' && luhnOk(x.n));
-      if(!strong){
-        const more=[];
-        for(const [t,M] of [[50,pick.M],[64,pick.M],[46,pick.M],[56,28-pick.M]]){
-          const r=await readBlock(pick.v.bl,pick.v.sc,pick.rot,t,M);
-          if(r.items.length) more.push(r.items);
-        }
-        reads = more.length ? more.concat([pick.items]) : reads;
-      }
-      const byType={};
-      voteReads(reads).forEach(cl=>{ (byType[cl.type]=byType[cl.type]||[]).push(cl); });
-      Object.values(byType).forEach(clusters=>{
-        clusters.sort((a,b)=>(b.agree-a.agree)||(b.members-a.members));  // one best candidate per type per block
-        const fin=finalizeCluster(clusters[0]);
-        fin.pos=[g.nx,g.ny];
-        results.push(fin);
-      });
-    }
-    onFrac((k+1)/groups.length);
+    if(!pick && (!bestTry || bestTry.conf<30)) break;
   }
-  const good=results.filter(x=>x.ok);
+  if(!pick && bestTry && bestTry.conf>=20){
+    for(const t of [50,64,32]){
+      const r=await readBlock(bestTry.v.bl,bestTry.v.sc,bestTry.rot,t,bestTry.M);
+      if(r.items.length){ pick={v:bestTry.v,rot:bestTry.rot,M:bestTry.M,items:r.items,conf:r.conf}; break; }
+    }
+  }
+  if(!pick) return [];
+  let reads=[pick.items];
+  const strong=pick.items.every(x=>x.type==='SIM' && luhnOk(x.n));
+  if(!strong){
+    const more=[];
+    for(const [t,M] of [[50,pick.M],[64,pick.M],[46,pick.M],[56,28-pick.M]]){
+      const r=await readBlock(pick.v.bl,pick.v.sc,pick.rot,t,M);
+      if(r.items.length) more.push(r.items);
+    }
+    reads = more.length ? more.concat([pick.items]) : reads;
+  }
+  const byType={};
+  voteReads(reads).forEach(cl=>{ (byType[cl.type]=byType[cl.type]||[]).push(cl); });
+  const fin=[];
+  Object.values(byType).forEach(clusters=>{
+    clusters.sort((a,b)=>(b.agree-a.agree)||(b.members-a.members));
+    const r=finalizeCluster(clusters[0]); r.pos=[g.nx,g.ny]; fin.push(r);
+  });
+  if(fin.some(r=>r.ok && r.type!=='Other')) return fin.filter(r=>r.type!=='Other');
+  return fin;
+}
+
+function groupRawBlocks(raw){
+  const groups=[];
+  raw.forEach(it=>{
+    let g=groups.find(g=>Math.hypot(g.nx-it.nx,g.ny-it.ny)<0.035);
+    if(!g){ g={nx:it.nx,ny:it.ny,variants:[]}; groups.push(g); }
+    g.variants.push(it);
+  });
+  return groups;
+}
+
+async function rawBlocksAtScale(pyr, base, L){
+  const sc=L/base, lv=pickLevel(pyr,L);
+  const gc=grayCanvas(lv.c,L), w=gc.width, h=gc.height;
+  const d=gc.getContext('2d',{willReadFrequently:true}).getImageData(0,0,w,h).data;
+  const g=new Uint8ClampedArray(w*h);
+  for(let i=0;i<w*h;i++) g[i]=d[i*4];
+  const out=findDigitBlocks(g,w,h).map(bl=>({bl,sc,nx:bl.cx/L,ny:bl.cy/L}));
+  await new Promise(r=>setTimeout(r,0));
+  return out;
+}
+
+async function scanNumbers(worker, file, onFrac){
+  const img0 = await loadImg(file), pyr = buildPyramid(img0), base = Math.max(img0.width,img0.height);
+  const raw1 = await rawBlocksAtScale(pyr, base, 1600);
+  const groups1 = groupRawBlocks(raw1);
+  let results = [];
+  for(let k=0;k<groups1.length;k++){
+    results.push(...await scanLabelGroup(worker, pyr, groups1[k]));
+    onFrac((k+1)/Math.max(1,groups1.length)*0.6);
+  }
+  // the sharper (slower) pass only runs where the first pass left something unread or unverified —
+  // most photos are clear enough that this second pass can be skipped entirely
+  const settled = results.length>0 && results.every(r=>r.ok);
+  if(!settled){
+    const resolvedPos = results.filter(r=>r.ok).map(r=>r.pos);
+    const raw2 = (await rawBlocksAtScale(pyr, base, 2400))
+      .filter(it=>!resolvedPos.some(p=>Math.hypot(p[0]-it.nx,p[1]-it.ny)<0.035));
+    const groups2 = groupRawBlocks(raw2);
+    for(let k=0;k<groups2.length;k++){
+      results.push(...await scanLabelGroup(worker, pyr, groups2[k]));
+      onFrac(0.6+(k+1)/Math.max(1,groups2.length)*0.4);
+    }
+  }
+  onFrac(1);
+  const good = results.filter(x=>x.ok);
   return results.filter(x=>x.ok || !good.some(gg=>Math.hypot(gg.pos[0]-x.pos[0],gg.pos[1]-x.pos[1])<0.035));
 }
+
 
 // ---------- Smarter regular-text OCR ----------
 const TARGET_H=38;
@@ -689,10 +712,14 @@ async function mergedPasses(worker,best){
   const runs=[best.data];
   await worker.setParameters({tessedit_pageseg_mode:'11'});
   runs.push((await worker.recognize(best.canvas)).data);
-  const inv=invertCanvas(best.canvas);
-  runs.push((await worker.recognize(inv)).data);
-  await worker.setParameters({tessedit_pageseg_mode:'3'});
-  runs.push((await worker.recognize(inv)).data);
+  // if that's already found plenty of confident words, skip the two slower inverted-image passes
+  const wordsSoFar=d=>(d.words||[]).filter(w=>(w.confidence||0)>=60).length;
+  if(wordsSoFar(runs[0])+wordsSoFar(runs[1]) < 18){
+    const inv=invertCanvas(best.canvas);
+    runs.push((await worker.recognize(inv)).data);
+    await worker.setParameters({tessedit_pageseg_mode:'3'});
+    runs.push((await worker.recognize(inv)).data);
+  }
   const cand=[];
   runs.forEach(d=>(d.words||[]).forEach(w=>{
     const t=(w.text||'').trim(), alnum=(t.match(/[\p{L}\p{N}]/gu)||[]).length;
@@ -753,56 +780,66 @@ function rotCanvas(c,deg){
   const x=o.getContext('2d'); x.translate(o.width/2,o.height/2); x.rotate(deg*Math.PI/180); x.drawImage(c,-c.width/2,-c.height/2);
   return o;
 }
+
+// ---------- Run: parallel workers across photos ----------
+async function makeWorker(lang){
+  const w = await Tesseract.createWorker(lang, 1, {});
+  return w;
+}
+async function processPhoto(worker, file, name, onProgress){
+  let results=[], text='';
+  try{
+    await worker.setParameters({ tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', tessedit_pageseg_mode:'6', user_defined_dpi:'300' });
+    results = await scanNumbers(worker, file, f=>onProgress(f*0.6));
+    await worker.setParameters({ tessedit_char_whitelist:'', preserve_interword_spaces:'1', tessedit_pageseg_mode:'3', user_defined_dpi:'300' });
+    const t = await ocrTextSmart(worker, file, true);
+    const letterRun = (t.match(/[A-Za-z]{3,}/g)||[]).join('').length;
+    if(letterRun >= 12) text = t;
+  }catch(err){
+    onProgress(1);
+    throw Object.assign(new Error(err.message||String(err)), {partial:{filename:name,results,text}});
+  }
+  onProgress(1);
+  return { filename:name, results, text };
+}
 runBtn.addEventListener('click', async ()=>{
   runBtn.disabled = true;
   progressEl.style.display = 'block';
   progressEl.value = 0;
   const lang = document.getElementById('langSel').value;
-  const enhance = document.getElementById('enhanceChk').checked;
-  const extracted = [];
-  let worker = null;
-  let curIdx = 0;
-  let lastErr = null;
+  const n = files.length;
+  // several photos process in parallel across a small pool of OCR workers — much faster for multi-photo scans,
+  // with no change to accuracy since each photo is still read exactly the same way
+  const poolSize = Math.max(1, Math.min(3, n, (navigator.hardwareConcurrency||4)-1 || 2));
+  const extracted = new Array(n);
+  let lastErr = null, done = 0;
+  const progress = new Array(n).fill(0);
+  const bump = (i,f)=>{ progress[i]=f; progressEl.value = progress.reduce((a,b)=>a+b,0)/n; };
+  let pool = [];
   try{
     statusEl.textContent = 'Loading OCR engine (first time takes a moment)…';
-    worker = await Tesseract.createWorker(lang, 1, {
-      logger: m=>{
-        if(m.status==='recognizing text'){
-          progressEl.value = (curIdx + m.progress) / files.length;
+    pool = await Promise.all(Array.from({length:poolSize},()=>makeWorker(lang)));
+    const queues = Array.from({length:poolSize},()=>[]);
+    files.forEach((f,i)=>queues[i%poolSize].push(i));
+    await Promise.all(pool.map((worker,wi)=> (async()=>{
+      for(const i of queues[wi]){
+        const name = files[i].name || `photo-${i+1}`;
+        statusEl.textContent = `Reading photo${n>1?'s':''} (${++done} of ${n} started)…`;
+        try{
+          extracted[i] = await processPhoto(worker, files[i], name, f=>bump(i,f));
+        }catch(err){
+          lastErr = err;
+          extracted[i] = err.partial || { filename:name, results:[], text:'' };
         }
       }
-    });
-    for (let i=0; i<files.length; i++){
-      curIdx = i;
-      const name = files[i].name || `photo-${i+1}`;
-      try{
-        statusEl.textContent = `Reading photo ${i+1} of ${files.length} — codes…`;
-        await worker.setParameters({ tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', tessedit_pageseg_mode:'6', user_defined_dpi:'300' });
-        const results = await scanNumbers(worker, files[i], f=>{ progressEl.value=(i+f*0.6)/files.length; });
-
-        statusEl.textContent = `Reading photo ${i+1} of ${files.length} — text…`;
-        await worker.setParameters({ tessedit_char_whitelist:'', preserve_interword_spaces:'1', tessedit_pageseg_mode:'3', user_defined_dpi:'300' });
-        let text = '';
-        try{
-          const t = await ocrTextSmart(worker, files[i], enhance);
-          const letterRun = (t.match(/[A-Za-z]{3,}/g)||[]).join('').length;   // skip near-empty / noise-only reads
-          if(letterRun >= 12) text = t;
-        }catch(e){ /* text pass is best-effort; codes above already succeeded or failed independently */ }
-
-        progressEl.value = (i+1)/files.length;
-        extracted.push({ filename: name, results, text });
-      }catch(err){
-        lastErr = err;
-        extracted.push({ filename: name, results: [], text: '' });
-      }
-    }
+    })()));
   }catch(err){
     statusEl.textContent = 'OCR engine failed to load — check your connection and try again.';
     progressEl.style.display = 'none';
     runBtn.disabled = false;
     return;
   }finally{
-    if(worker){ try{ await worker.terminate(); }catch(e){} }
+    await Promise.all(pool.map(w=>w.terminate().catch(()=>{})));
   }
   progressEl.value = 1;
   statusEl.textContent = 'Sorting results…';
@@ -815,12 +852,11 @@ runBtn.addEventListener('click', async ()=>{
     items:[{ filename:nothing.map(e=>e.filename).join(', '), text:'',
              notes:['Try a closer, sharper, well-lit photo.'] }] });
   renderResults();
-  statusEl.textContent = lastErr ? `Some photos failed: ${lastErr.message||lastErr}. ` : ''; statusEl.textContent += `Done — ${extracted.length} photo${extracted.length===1?'':'s'} processed. If something looks wrong, try toggling "Enhance image" or the language.`;
+  statusEl.textContent = lastErr ? `Some photos failed: ${lastErr.message||lastErr}. ` : ''; statusEl.textContent += `Done — ${n} photo${n===1?'':'s'} processed. If something looks wrong, try toggling "Enhance image" or the language.`;
   progressEl.style.display = 'none';
   runBtn.disabled = false;
   exportCard.style.display = 'block';
 });
-
 
 async function categorize(items){
   const nonEmpty = items.filter(it=>it.text.length>0);

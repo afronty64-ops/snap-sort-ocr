@@ -108,9 +108,13 @@
       <label><input type="checkbox" id="enhanceChk" checked> Enhance image (recommended)</label>
     </div>
     <div class="btnrow">
-      <button class="primary" id="runBtn" disabled>Extract &amp; sort text</button>
+      <button class="primary" id="serialBtn" disabled>🔢 Serials</button>
+      <button class="primary" id="generalBtn" disabled>📝 General</button>
+    </div>
+    <div class="btnrow">
       <button id="clearBtn" style="display:none">Clear</button>
     </div>
+    <p class="sub" style="margin:6px 0 0">Serials: SIM cards, T3/A10/NETS, and other serial-style codes. General: notes, labels, and regular text. Language and Enhance apply to General.</p>
     <div class="status" id="status"></div>
     <progress id="progress" value="0" max="1" style="display:none"></progress>
   </div>
@@ -133,7 +137,8 @@
 const fileInput = document.getElementById('fileInput');
 const dropZone = document.getElementById('dropZone');
 const thumbs = document.getElementById('thumbs');
-const runBtn = document.getElementById('runBtn');
+const serialBtn = document.getElementById('serialBtn');
+const generalBtn = document.getElementById('generalBtn');
 const clearBtn = document.getElementById('clearBtn');
 const statusEl = document.getElementById('status');
 const progressEl = document.getElementById('progress');
@@ -171,7 +176,8 @@ function renderThumbs(){
     div.appendChild(img);
     thumbs.appendChild(div);
   });
-  runBtn.disabled = files.length === 0;
+  serialBtn.disabled = files.length === 0;
+  generalBtn.disabled = files.length === 0;
   clearBtn.style.display = files.length ? 'inline-block' : 'none';
 }
 
@@ -786,33 +792,18 @@ async function makeWorker(lang){
   const w = await Tesseract.createWorker(lang, 1, {});
   return w;
 }
-async function processPhoto(worker, file, name, onProgress){
-  let results=[], text='';
-  try{
-    await worker.setParameters({ tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', tessedit_pageseg_mode:'6', user_defined_dpi:'300' });
-    results = await scanNumbers(worker, file, f=>onProgress(f*0.6));
-    await worker.setParameters({ tessedit_char_whitelist:'', preserve_interword_spaces:'1', tessedit_pageseg_mode:'3', user_defined_dpi:'300' });
-    const t = await ocrTextSmart(worker, file, true);
-    const letterRun = (t.match(/[A-Za-z]{3,}/g)||[]).join('').length;
-    if(letterRun >= 12) text = t;
-  }catch(err){
-    onProgress(1);
-    throw Object.assign(new Error(err.message||String(err)), {partial:{filename:name,results,text}});
-  }
-  onProgress(1);
-  return { filename:name, results, text };
-}
-runBtn.addEventListener('click', async ()=>{
-  runBtn.disabled = true;
+async function runPipeline(track){
+  serialBtn.disabled = true;
+  generalBtn.disabled = true;
   progressEl.style.display = 'block';
   progressEl.value = 0;
   const lang = document.getElementById('langSel').value;
+  const enhance = document.getElementById('enhanceChk').checked;
   const n = files.length;
-  // several photos process in parallel across a small pool of OCR workers — much faster for multi-photo scans,
-  // with no change to accuracy since each photo is still read exactly the same way
+  // several photos process in parallel across a small pool of OCR workers
   const poolSize = Math.max(1, Math.min(3, n, (navigator.hardwareConcurrency||4)-1 || 2));
   const extracted = new Array(n);
-  let lastErr = null, done = 0;
+  let lastErr = null;
   const progress = new Array(n).fill(0);
   const bump = (i,f)=>{ progress[i]=f; progressEl.value = progress.reduce((a,b)=>a+b,0)/n; };
   let pool = [];
@@ -824,39 +815,55 @@ runBtn.addEventListener('click', async ()=>{
     await Promise.all(pool.map((worker,wi)=> (async()=>{
       for(const i of queues[wi]){
         const name = files[i].name || `photo-${i+1}`;
-        statusEl.textContent = `Reading photo${n>1?'s':''} (${++done} of ${n} started)…`;
+        statusEl.textContent = `Reading photo${n>1?'s':''}…`;
         try{
-          extracted[i] = await processPhoto(worker, files[i], name, f=>bump(i,f));
+          if(track==='serials'){
+            await worker.setParameters({ tessedit_char_whitelist:'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', tessedit_pageseg_mode:'6', user_defined_dpi:'300' });
+            const results = await scanNumbers(worker, files[i], f2=>bump(i,f2));
+            extracted[i] = { filename:name, results, text:'' };
+          } else {
+            await worker.setParameters({ tessedit_char_whitelist:'', preserve_interword_spaces:'1', tessedit_pageseg_mode:'3', user_defined_dpi:'300' });
+            const t = await ocrTextSmart(worker, files[i], enhance);
+            bump(i,1);
+            extracted[i] = { filename:name, results:[], text:t };
+          }
         }catch(err){
           lastErr = err;
-          extracted[i] = err.partial || { filename:name, results:[], text:'' };
+          extracted[i] = { filename:name, results:[], text:'' };
+          bump(i,1);
         }
       }
     })()));
   }catch(err){
     statusEl.textContent = 'OCR engine failed to load — check your connection and try again.';
     progressEl.style.display = 'none';
-    runBtn.disabled = false;
+    serialBtn.disabled = false; generalBtn.disabled = false;
     return;
   }finally{
     await Promise.all(pool.map(w=>w.terminate().catch(()=>{})));
   }
   progressEl.value = 1;
   statusEl.textContent = 'Sorting results…';
-  const codeGroups = numberGroups(extracted);
-  const textPhotos = extracted.filter(ex=>ex.text);
-  const textGroups = textPhotos.length ? await categorize(textPhotos) : [];
-  const nothing = extracted.filter(ex=>!(ex.results||[]).length && !ex.text);
-  groups = codeGroups.concat(textGroups);
-  if(nothing.length) groups.push({ category:'Nothing found', kind:'text', count:nothing.length,
-    items:[{ filename:nothing.map(e=>e.filename).join(', '), text:'',
-             notes:['Try a closer, sharper, well-lit photo.'] }] });
+  if(track==='serials'){
+    groups = numberGroups(extracted);
+    const nothing = extracted.filter(ex=>!(ex.results||[]).length);
+    if(!groups.length || nothing.length===n) groups.push({ category:'No serials found', kind:'code', count:nothing.length||n,
+      items:[{ filename:extracted.map(e=>e.filename).join(', '), text:'', notes:['Try a closer, sharper, well-lit photo of just the label.'] }] });
+  } else {
+    const textPhotos = extracted.filter(ex=>ex.text);
+    groups = textPhotos.length ? await categorize(textPhotos) : [{ category:'No text found', kind:'text',
+      items:[{ filename:extracted.map(e=>e.filename).join(', '), text:'', notes:['Try a closer, sharper, well-lit photo.'] }] }];
+  }
   renderResults();
-  statusEl.textContent = lastErr ? `Some photos failed: ${lastErr.message||lastErr}. ` : ''; statusEl.textContent += `Done — ${n} photo${n===1?'':'s'} processed. If something looks wrong, try toggling "Enhance image" or the language.`;
+  statusEl.textContent = lastErr ? `Some photos failed: ${lastErr.message||lastErr}. ` : '';
+  statusEl.textContent += `Done — ${n} photo${n===1?'':'s'} processed (${track==='serials'?'serials':'general text'}).`;
   progressEl.style.display = 'none';
-  runBtn.disabled = false;
+  serialBtn.disabled = false; generalBtn.disabled = false;
   exportCard.style.display = 'block';
-});
+}
+serialBtn.addEventListener('click', ()=>runPipeline('serials'));
+generalBtn.addEventListener('click', ()=>runPipeline('general'));
+
 
 async function categorize(items){
   const nonEmpty = items.filter(it=>it.text.length>0);
